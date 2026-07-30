@@ -1,0 +1,8 @@
+requests
+pytrends
+praw
+vaderSentiment
+binance-connector
+
+telethon
+binance-futures-connector

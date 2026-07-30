@@ -1,0 +1,36 @@
+# secrets — never commit
+.env
+telegram_session.session
+*.session
+
+# virtualenvs (regenerate via requirements.txt)
+venv/
+kronos_venv/
+freqtrade_venv/
+
+# cloned external repo (regenerate via git clone)
+kronos_repo/
+
+# freqtrade side-experiment: huge logs/db + embedded testnet API keys in config.json
+freqtrade_workspace/
+
+# python
+__pycache__/
+*.pyc
+
+# logs
+*.log
+
+# generated/regenerable runtime state — not source, gets rewritten every cycle
+last_seen_legs.json
+last_top_candidate.json
+last_worst_candidate.json
+portfolio_peak.json
+short_positions.json
+trade_stop_pcts.json
+traded_symbols.json
+golden_trade_ids.json
+dashboard.html
+
+# macOS
+.DS_Store
