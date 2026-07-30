@@ -30,6 +30,9 @@ short_positions.json
 trade_stop_pcts.json
 traded_symbols.json
 golden_trade_ids.json
+daily_loss_spot.json
+daily_loss_futures.json
+KILL_SWITCH
 dashboard.html
 
 # macOS

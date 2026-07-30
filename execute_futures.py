@@ -26,16 +26,34 @@ from decimal import Decimal
 
 from binance.um_futures import UMFutures
 
-from execute import _record_traded_symbol, _round_step, compute_atr_stop_loss_pct, make_trade_id
+from execute import (
+    DAILY_LOSS_LIMIT_PCT,
+    MIN_REWARD_RISK_RATIO,
+    _record_traded_symbol,
+    _round_step,
+    check_daily_loss_limit,
+    compute_atr_stop_loss_pct,
+    compute_atr_take_profit_pcts,
+    compute_vwap_deviation_pct,
+    is_counter_trend,
+    is_extended_from_vwap,
+    kill_switch_active,
+    make_trade_id,
+    meets_min_reward_risk,
+    obv_warns_against,
+)
 from scanner import (
     get_binance_momentum_short,
     get_binance_universe,
     get_cmc_movers,
     get_dexscreener_trend,
+    get_fear_greed_index,
     get_google_trends,
     get_kronos_forecast,
     get_llm_short_verdict,
+    get_obv_divergence,
     get_rsi,
+    get_vwap,
     rank_symbols,
 )
 
@@ -51,6 +69,7 @@ FUTURES_RSI_OVERSOLD_THRESHOLD = Decimal(os.environ.get("FUTURES_RSI_OVERSOLD_TH
 SHORT_POSITIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "short_positions.json")
 SHORT_CONFIRM_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_worst_candidate.json")
 SHORT_JOURNAL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "short_trade_journal.jsonl")
+DAILY_LOSS_FILE_FUTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_loss_futures.json")
 
 
 def get_futures_client() -> UMFutures:
@@ -287,6 +306,14 @@ def run_once_short() -> None:
     print("Checking open short positions for early-exit opportunities...")
     manage_short_positions(client)
 
+    if kill_switch_active():
+        print("KILL_SWITCH active — skipping new short evaluation this cycle.")
+        return
+
+    fear_greed = get_fear_greed_index()  # macro overlay, same for every candidate this cycle
+    if fear_greed is not None:
+        print(f"  Fear & Greed Index: {fear_greed}")
+
     max_price = float(os.environ.get("MAX_PRICE_USD", "5.0"))
     universe = get_binance_universe(max_price=max_price)
     momentum = get_binance_momentum_short(universe, window="1h")
@@ -315,7 +342,7 @@ def run_once_short() -> None:
     _save_worst_confirm_pool(ranked)
     open_symbols = {p["symbol"] for p in get_open_short_positions(client)}
 
-    from execute import KRONOS_NORMALIZE_PCT, KRONOS_VETO_THRESHOLD, KRONOS_WEIGHT, LLM_WEIGHT, OPPORTUNITY_THRESHOLD
+    from execute import compute_opportunity_score
 
     chosen = None
     for sym in ranked:
@@ -335,6 +362,24 @@ def run_once_short() -> None:
             print(f"  {sym} RSI {rsi:.1f} is oversold (<{FUTURES_RSI_OVERSOLD_THRESHOLD}), bounce risk, skipping.")
             continue
 
+        daily = get_binance_momentum_short([sym], window="1d").get(sym)
+        daily_pct = Decimal(str(daily["pct_change_24h"])) if daily else None
+        if is_counter_trend(daily_pct, is_short=True):
+            print(f"  {sym}: 1h signal fighting a bullish 24h trend ({daily_pct:+.1f}%), counter-trend, skipping.")
+            continue
+
+        current_price = Decimal(client.ticker_price(symbol=f"{sym}USDT")["price"])
+        vwap = get_vwap(sym)
+        vwap_dev = compute_vwap_deviation_pct(current_price, Decimal(str(vwap))) if vwap else None
+        if is_extended_from_vwap(vwap_dev, is_short=True):
+            print(f"  {sym}: price {vwap_dev:+.1f}% below rolling VWAP, overextended, likely to revert, skipping.")
+            continue
+
+        obv_div = get_obv_divergence(sym)
+        if obv_warns_against(obv_div, is_short=True):
+            print(f"  {sym}: {obv_div} OBV divergence — volume isn't confirming the price move, skipping.")
+            continue
+
         kronos = get_kronos_forecast(sym)
         verdict = get_llm_short_verdict(sym, {"rank_score": score, **momentum[sym]}, kronos=kronos)
         if verdict is None:
@@ -346,31 +391,30 @@ def run_once_short() -> None:
             continue
 
         kronos_pct = Decimal(str(kronos["predicted_pct_change"])) if kronos else None
-        # mirror of compute_opportunity_score: for a short we WANT a bearish
-        # (negative) Kronos forecast, so negate it before scoring the same
-        # way a long scores a bullish one; the veto fires on a forecast
-        # bullish enough (>= +5%) to threaten a short squeeze.
-        if kronos_pct is None:
-            kronos_score = Decimal("0")
-        else:
-            kronos_score = max(Decimal("-1"), min(Decimal("1"), -kronos_pct / KRONOS_NORMALIZE_PCT))
-        llm_score = Decimal(str(verdict["confidence"]))
-        opportunity_score = KRONOS_WEIGHT * kronos_score + LLM_WEIGHT * llm_score
-        veto = kronos_pct is not None and kronos_pct >= -KRONOS_VETO_THRESHOLD
-        print(f"  Short opportunity score: Kronos {kronos_score:+.2f} (predicts {kronos_pct if kronos_pct is not None else 'n/a'}) "
-              f"x {KRONOS_WEIGHT} + LLM {llm_score:.2f} x {LLM_WEIGHT} = {opportunity_score:+.2f} vs threshold {OPPORTUNITY_THRESHOLD}"
-              + (" — VETOED (bullish enough to risk a squeeze)" if veto else ""))
-        if opportunity_score < OPPORTUNITY_THRESHOLD or veto:
+        opportunity = compute_opportunity_score(
+            Decimal(str(verdict["confidence"])), kronos_pct, fear_greed=fear_greed, is_short=True,
+        )
+        print(f"  Short opportunity score: {opportunity['reasoning']}")
+        if not opportunity["passes"]:
             print(f"  {sym}: opportunity score fails the gate.")
             continue
 
-        chosen = {"symbol": sym, "score": score, "verdict": verdict}
+        stop_loss_pct = compute_atr_stop_loss_pct(sym, current_price)
+        take_profit_pct = compute_atr_take_profit_pcts(stop_loss_pct)[0]  # shorts aren't laddered, leg 1 only
+        if not meets_min_reward_risk(take_profit_pct, stop_loss_pct):
+            print(f"  {sym}: R:R {take_profit_pct / stop_loss_pct:.2f}:1 (TP {take_profit_pct * 100:.0f}% / "
+                  f"stop {stop_loss_pct * 100:.1f}%) below minimum {MIN_REWARD_RISK_RATIO}:1, skipping.")
+            continue
+
+        chosen = {"symbol": sym, "score": score, "verdict": verdict, "stop_loss_pct": stop_loss_pct, "take_profit_pct": take_profit_pct}
         break
 
     if chosen is None:
         print("No short candidate this cycle cleared every gate.")
         return
     worst_symbol, worst_score, verdict = chosen["symbol"], chosen["score"], chosen["verdict"]
+    stop_loss_pct = chosen["stop_loss_pct"]
+    take_profit_pct = chosen["take_profit_pct"]
 
     account = client.account()
     usdt = next((a for a in account["assets"] if a["asset"] == "USDT"), None)
@@ -387,6 +431,12 @@ def run_once_short() -> None:
         print("Not shorting — already at or over the futures exposure cap.")
         return
 
+    daily_halted, daily_pnl_pct = check_daily_loss_limit(total_value, DAILY_LOSS_FILE_FUTURES)
+    print(f"Today's futures P&L: {daily_pnl_pct:+.2f}% (limit -{DAILY_LOSS_LIMIT_PCT}%)")
+    if daily_halted:
+        print(f"Not shorting — daily loss limit hit ({daily_pnl_pct:+.2f}% <= -{DAILY_LOSS_LIMIT_PCT}%). Resets at UTC midnight.")
+        return
+
     per_trade_cap = (FUTURES_MAX_PORTFOLIO_PCT * total_value) / FUTURES_POSITION_SPLIT
     margin = min(balance, room, per_trade_cap)
     if margin < 5:
@@ -394,10 +444,10 @@ def run_once_short() -> None:
         return
 
     exchange_info = client.exchange_info()
-    current_price = Decimal(client.ticker_price(symbol=f"{worst_symbol}USDT")["price"])
-    stop_loss_pct = compute_atr_stop_loss_pct(worst_symbol, current_price)
     print(f"ATR-based stop-loss: {stop_loss_pct * 100:.1f}% (vs flat {FUTURES_STOP_LOSS_PCT * 100:.0f}% default)")
-    result = open_short(client, exchange_info, worst_symbol, margin, leverage=FUTURES_LEVERAGE, stop_loss_pct=stop_loss_pct)
+    print(f"ATR-based take-profit: {take_profit_pct * 100:.1f}% (vs flat {FUTURES_TAKE_PROFIT_PCT * 100:.0f}% default)")
+    result = open_short(client, exchange_info, worst_symbol, margin, leverage=FUTURES_LEVERAGE,
+                         stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct)
     print(f"\nShorted {result['qty']} {worst_symbol} @ ~{result['entry_price']} "
           f"({FUTURES_LEVERAGE}x, margin ${margin:.2f}). "
           f"SL={result['stop_price']} TP={result['take_profit']}")

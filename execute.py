@@ -23,11 +23,14 @@ from scanner import (
     get_binance_universe,
     get_cmc_movers,
     get_dexscreener_trend,
+    get_fear_greed_index,
     get_google_trends,
     get_kronos_forecast,
     get_llm_verdict,
     get_market_breadth,
+    get_obv_divergence,
     get_rsi,
+    get_vwap,
     rank_symbols,
 )
 
@@ -440,14 +443,159 @@ def _test_compute_atr_stop_loss_pct() -> None:
     # price <= 0 -> also falls back rather than dividing by zero
     assert compute_atr_stop_loss_pct("BTC", Decimal("0")) == DEFAULT_STOP_LOSS_PCT
 
+
+ATR_TP_RATIO_MULTIPLIERS = (
+    Decimal(os.environ.get("ATR_TP_RATIO_1", "2")),
+    Decimal(os.environ.get("ATR_TP_RATIO_2", "4")),
+)
+
+
+def compute_atr_take_profit_pcts(stop_loss_pct: Decimal) -> tuple[Decimal, Decimal]:
+    """ATR-scaled take-profit legs, DERIVED FROM the already-computed ATR
+    stop-loss rather than independently re-clamped from raw ATR.
+
+    First attempt clamped stop and TP separately from their own
+    [min, max] bounds — found live to be internally inconsistent: a calm
+    coin clamps the stop to its 8% floor and the TP to its own 10% floor,
+    giving a 1.25:1 ratio that doesn't match MIN_REWARD_RISK_RATIO at all;
+    a volatile coin can push BOTH TP legs past their ceiling to the same
+    clamped value, collapsing the two-leg ladder into one. Deriving TP as
+    a straight multiple of the stop (ATR_TP_RATIO_1/2, default 2x/4x)
+    fixes both: the ratio is exact by construction regardless of where the
+    stop landed in its own clamp range, and leg 2 is always double leg 1's
+    distance so the ladder never degenerates. 'Crypto Trading
+    Strategies.md' asks for ATR-calibrated targets, not just stops — this
+    achieves that while staying self-consistent with the R:R gate."""
+    return tuple(stop_loss_pct * mult for mult in ATR_TP_RATIO_MULTIPLIERS)
+
+
+def _test_compute_atr_take_profit_pcts() -> None:
+    legs = compute_atr_take_profit_pcts(Decimal("0.10"))
+    assert legs == (Decimal("0.20"), Decimal("0.40")), legs
+    assert legs[1] == legs[0] * 2, "leg 2 must always be twice leg 1's distance"
+
+
+COUNTER_TREND_THRESHOLD_PCT = Decimal(os.environ.get("COUNTER_TREND_THRESHOLD_PCT", "5"))
+
+
+def is_counter_trend(daily_pct_change: Decimal | None, is_short: bool = False) -> bool:
+    """'Crypto Trading Strategies.md': counter-trend trades are higher risk
+    than reversals that align with the larger trend ("taking a counter-
+    trend trade is higher risk... generally safer [to trade] in the
+    direction of the macro trend"). A 1h-bullish long signal fighting a
+    meaningfully bearish 24h trend (or the mirror for a 1h-bearish short
+    fighting a meaningfully bullish 24h trend) is exactly that shape.
+    None (no 24h data this cycle) never blocks — this is an extra caution
+    layer on top of the other gates, not a required signal on its own."""
+    if daily_pct_change is None:
+        return False
+    if is_short:
+        return daily_pct_change >= COUNTER_TREND_THRESHOLD_PCT
+    return daily_pct_change <= -COUNTER_TREND_THRESHOLD_PCT
+
+
+def _test_is_counter_trend() -> None:
+    # long fighting a meaningfully bearish 24h trend -> counter-trend
+    assert is_counter_trend(Decimal("-8")) is True
+    # long with a mildly negative 24h (noise, not a real trend) -> not flagged
+    assert is_counter_trend(Decimal("-2")) is False
+    # long with a positive/neutral 24h -> aligned, not counter-trend
+    assert is_counter_trend(Decimal("3")) is False
+    # no 24h data -> never blocks
+    assert is_counter_trend(None) is False
+    # short fighting a meaningfully bullish 24h trend -> counter-trend
+    assert is_counter_trend(Decimal("8"), is_short=True) is True
+    assert is_counter_trend(Decimal("-8"), is_short=True) is False
+
+
+VWAP_DEVIATION_THRESHOLD_PCT = Decimal(os.environ.get("VWAP_DEVIATION_THRESHOLD_PCT", "10"))
+
+
+def compute_vwap_deviation_pct(price: Decimal, vwap: Decimal) -> Decimal:
+    """% price sits above (+) or below (-) the rolling VWAP."""
+    return (price / vwap - 1) * 100
+
+
+def is_extended_from_vwap(deviation_pct: Decimal | None, is_short: bool = False) -> bool:
+    """'Crypto Trading Strategies.md': VWAP acts as a fair-value magnet —
+    price stretched too far from it tends to revert. A long chasing price
+    already far ABOVE VWAP, or a short chasing price already far BELOW
+    VWAP, is buying/selling into that reversion instead of with it. None
+    (no VWAP data this cycle) never blocks."""
+    if deviation_pct is None:
+        return False
+    if is_short:
+        return deviation_pct <= -VWAP_DEVIATION_THRESHOLD_PCT
+    return deviation_pct >= VWAP_DEVIATION_THRESHOLD_PCT
+
+
+def _test_vwap_deviation() -> None:
+    dev = compute_vwap_deviation_pct(Decimal("110"), Decimal("100"))
+    assert dev == Decimal("10"), dev
+    assert is_extended_from_vwap(Decimal("12")) is True  # long, far above VWAP
+    assert is_extended_from_vwap(Decimal("5")) is False  # long, mild stretch
+    assert is_extended_from_vwap(Decimal("-12")) is False  # long, far below VWAP is fine (not chasing)
+    assert is_extended_from_vwap(None) is False
+    assert is_extended_from_vwap(Decimal("-12"), is_short=True) is True  # short, far below VWAP
+    assert is_extended_from_vwap(Decimal("12"), is_short=True) is False
+
+
+def obv_warns_against(divergence: str | None, is_short: bool = False) -> bool:
+    """'Crypto Trading Strategies.md': an OBV divergence means volume isn't
+    confirming price — the move is more fragile than it looks. A 'bearish'
+    divergence (price up, volume distributing) warns against going long;
+    the mirror 'bullish' divergence (price down, volume accumulating)
+    warns against going short. None (no divergence, or no data) never
+    blocks — this only fires when volume is actively disagreeing."""
+    if divergence is None:
+        return False
+    return divergence == ("bullish" if is_short else "bearish")
+
+
+def _test_obv_warns_against() -> None:
+    assert obv_warns_against("bearish") is True  # long, price up unconfirmed
+    assert obv_warns_against("bullish") is False  # long, no conflict
+    assert obv_warns_against(None) is False
+    assert obv_warns_against("bullish", is_short=True) is True  # short, price down unconfirmed
+    assert obv_warns_against("bearish", is_short=True) is False
+
+
+MIN_REWARD_RISK_RATIO = Decimal(os.environ.get("MIN_REWARD_RISK_RATIO", "2.0"))
+
+
+def meets_min_reward_risk(tp_pct: Decimal, stop_loss_pct: Decimal, min_ratio: Decimal = MIN_REWARD_RISK_RATIO) -> bool:
+    """Reward:risk gate ('Crypto Trading Strategies.md': demand >=3:1 R:R on
+    high-risk momentum trades so even a sub-50% win rate nets positive).
+    MIN_REWARD_RISK_RATIO defaults to 2.0, a bit below the source's 3:1, to
+    stay compatible with the ladder's real TP1/stop shape rather than
+    rejecting almost everything on day one — raise it toward 3.0 to match
+    the source material more strictly once there's live data to tune from."""
+    if stop_loss_pct <= 0:
+        return False
+    return (tp_pct / stop_loss_pct) >= min_ratio
+
+
+def _test_meets_min_reward_risk() -> None:
+    assert meets_min_reward_risk(Decimal("0.30"), Decimal("0.10")) is True  # 3:1
+    assert meets_min_reward_risk(Decimal("0.15"), Decimal("0.10")) is False  # 1.5:1, below 2.0 default
+    assert meets_min_reward_risk(Decimal("0.10"), Decimal("0")) is False  # no div-by-zero
+
+
 KRONOS_NORMALIZE_PCT = Decimal(os.environ.get("KRONOS_NORMALIZE_PCT", "5"))  # a +/-5% Kronos forecast maps to +/-1.0 conviction
 KRONOS_VETO_THRESHOLD = Decimal(os.environ.get("KRONOS_VETO_THRESHOLD", "-5"))  # hard reject below this, no matter how confident the LLM is
 KRONOS_WEIGHT = Decimal(os.environ.get("KRONOS_WEIGHT", "0.3"))
 LLM_WEIGHT = Decimal(os.environ.get("LLM_WEIGHT", "0.7"))
 OPPORTUNITY_THRESHOLD = Decimal(os.environ.get("OPPORTUNITY_THRESHOLD", "0.3"))
 
+FEAR_GREED_EXTREME_GREED = int(os.environ.get("FEAR_GREED_EXTREME_GREED", "75"))
+FEAR_GREED_EXTREME_FEAR = int(os.environ.get("FEAR_GREED_EXTREME_FEAR", "25"))
+FEAR_GREED_NUDGE = Decimal(os.environ.get("FEAR_GREED_NUDGE", "0.1"))
 
-def compute_opportunity_score(llm_confidence: Decimal, kronos_pct: Decimal | None) -> dict:
+
+def compute_opportunity_score(
+    llm_confidence: Decimal, kronos_pct: Decimal | None,
+    fear_greed: int | None = None, is_short: bool = False,
+) -> dict:
     """Two independent confidence scores blended into one buy/no-buy gate,
     instead of the LLM's own confidence being the only thing that decides.
 
@@ -466,25 +614,54 @@ def compute_opportunity_score(llm_confidence: Decimal, kronos_pct: Decimal | Non
     - veto: Kronos alone can hard-block a trade if it's bearish enough
       (<= KRONOS_VETO_THRESHOLD%, same -5% bar used elsewhere for early-exit
       "fading" calls) — no LLM confidence talks its way past that.
+    - fear_greed: small CONTRARIAN nudge from the Fear & Greed Index, not a
+      per-symbol signal — a macro overlay. Extreme greed nudges a long DOWN
+      (be fearful when others are greedy) and a short UP; extreme fear does
+      the opposite. Anything in between is neutral (no nudge).
+    - is_short: mirrors the WHOLE function for the short side (used to live
+      as a hand-duplicated copy in execute_futures.py — folded back in here
+      so there's one implementation, not two to keep in sync). Flips which
+      Kronos direction counts as "good" (bearish is good for a short) and
+      which direction the veto fires on (bullish enough to risk a squeeze).
     """
     if kronos_pct is None:
         kronos_score = Decimal("0")
     else:
-        kronos_score = max(Decimal("-1"), min(Decimal("1"), kronos_pct / KRONOS_NORMALIZE_PCT))
+        signed_pct = -kronos_pct if is_short else kronos_pct
+        kronos_score = max(Decimal("-1"), min(Decimal("1"), signed_pct / KRONOS_NORMALIZE_PCT))
 
     llm_score = llm_confidence
     opportunity_score = KRONOS_WEIGHT * kronos_score + LLM_WEIGHT * llm_score
-    veto = kronos_pct is not None and kronos_pct <= KRONOS_VETO_THRESHOLD
+
+    fear_greed_note = ""
+    if fear_greed is not None:
+        if fear_greed >= FEAR_GREED_EXTREME_GREED:
+            nudge = FEAR_GREED_NUDGE if is_short else -FEAR_GREED_NUDGE
+            opportunity_score += nudge
+            fear_greed_note = f" Fear&Greed {fear_greed} (extreme greed) contrarian nudge {nudge:+.2f}."
+        elif fear_greed <= FEAR_GREED_EXTREME_FEAR:
+            nudge = -FEAR_GREED_NUDGE if is_short else FEAR_GREED_NUDGE
+            opportunity_score += nudge
+            fear_greed_note = f" Fear&Greed {fear_greed} (extreme fear) contrarian nudge {nudge:+.2f}."
+
+    if is_short:
+        veto = kronos_pct is not None and kronos_pct >= -KRONOS_VETO_THRESHOLD
+    else:
+        veto = kronos_pct is not None and kronos_pct <= KRONOS_VETO_THRESHOLD
     passes = opportunity_score >= OPPORTUNITY_THRESHOLD and not veto
 
     direction = "bullish" if kronos_score > 0 else ("bearish" if kronos_score < 0 else "neutral")
+    veto_reason = (
+        "bullish enough to risk a squeeze" if is_short else "bearish enough to fade"
+    )
     reasoning = (
         f"Kronos: {kronos_score:+.2f} conviction ({direction}"
         + (f", predicts {kronos_pct:+.2f}%" if kronos_pct is not None else ", no forecast this cycle")
         + f") x weight {KRONOS_WEIGHT} = {KRONOS_WEIGHT * kronos_score:+.2f}. "
-        f"LLM: {llm_score:.2f} confidence x weight {LLM_WEIGHT} = {LLM_WEIGHT * llm_score:+.2f}. "
+        f"LLM: {llm_score:.2f} confidence x weight {LLM_WEIGHT} = {LLM_WEIGHT * llm_score:+.2f}."
+        f"{fear_greed_note} "
         f"Opportunity score {opportunity_score:+.2f} vs threshold {OPPORTUNITY_THRESHOLD} -> "
-        + ("PASSES." if passes else "FAILS" + (" (Kronos veto — bearish enough to fade regardless of LLM confidence)." if veto else "."))
+        + ("PASSES." if passes else f"FAILS" + (f" (Kronos veto — {veto_reason} regardless of LLM confidence)." if veto else "."))
     )
     return {
         "kronos_score": kronos_score, "llm_score": llm_score,
@@ -510,6 +687,25 @@ def _test_compute_opportunity_score() -> None:
     # (this is the exact NIL-#2 shape: llm=0.70, kronos=-6.31%)
     r = compute_opportunity_score(Decimal("0.70"), Decimal("-6.31"))
     assert r["passes"] is False, r
+
+    # fear & greed contrarian nudges
+    base = compute_opportunity_score(Decimal("0.60"), Decimal("1"))["opportunity_score"]
+    greedy_long = compute_opportunity_score(Decimal("0.60"), Decimal("1"), fear_greed=90)
+    assert greedy_long["opportunity_score"] < base, "extreme greed should nudge a long DOWN"
+    fearful_long = compute_opportunity_score(Decimal("0.60"), Decimal("1"), fear_greed=10)
+    assert fearful_long["opportunity_score"] > base, "extreme fear should nudge a long UP"
+    base_short = compute_opportunity_score(Decimal("0.60"), Decimal("1"), is_short=True)["opportunity_score"]
+    greedy_short = compute_opportunity_score(Decimal("0.60"), Decimal("1"), fear_greed=90, is_short=True)
+    assert greedy_short["opportunity_score"] > base_short, "extreme greed should nudge a short UP"
+    neutral = compute_opportunity_score(Decimal("0.60"), Decimal("1"), fear_greed=50)
+    assert neutral["opportunity_score"] == base, "neutral fear/greed should not nudge at all"
+
+    # is_short: bearish Kronos is GOOD for a short (opposite of long)
+    r = compute_opportunity_score(Decimal("0.70"), Decimal("-6"), is_short=True)
+    assert r["passes"] is True, f"bearish Kronos should favor a short, got {r}"
+    # is_short veto: bullish enough Kronos threatens a squeeze -> vetoed
+    r = compute_opportunity_score(Decimal("0.90"), Decimal("8"), is_short=True)
+    assert r["veto"] is True and r["passes"] is False, f"strongly bullish Kronos should veto a short, got {r}"
     print("compute_opportunity_score self-check OK")
 
 
@@ -597,6 +793,70 @@ def _update_peak_and_drawdown(total_value: Decimal) -> Decimal:
     with open(PEAK_FILE, "w") as f:
         json.dump({"peak": str(peak)}, f)
     return (peak - total_value) / peak if peak > 0 else Decimal("0")
+
+
+DAILY_LOSS_LIMIT_PCT = Decimal(os.environ.get("DAILY_LOSS_LIMIT_PCT", "10"))
+DAILY_LOSS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "daily_loss_spot.json")
+
+
+def check_daily_loss_limit(current_value: Decimal, state_file: str) -> tuple[bool, Decimal]:
+    """Hard binary halt ('Futureproof Wealth' Ch.9 — "daily loss limit" is
+    named as its own risk rule, distinct from position-size throttling).
+    Unlike the drawdown circuit breaker (which only shrinks bet size and
+    never fully stops), this BLOCKS new trades outright once today's P&L
+    drops below -DAILY_LOSS_LIMIT_PCT, resetting at UTC midnight. Separate
+    state file per book (spot vs futures) since they're independent
+    portfolios. Returns (halted, daily_pnl_pct)."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    start_value = current_value
+    if os.path.exists(state_file):
+        with open(state_file) as f:
+            state = json.load(f)
+        if state.get("date") == today:
+            start_value = Decimal(state["start_value"])
+        else:
+            with open(state_file, "w") as f:
+                json.dump({"date": today, "start_value": str(current_value)}, f)
+    else:
+        with open(state_file, "w") as f:
+            json.dump({"date": today, "start_value": str(current_value)}, f)
+
+    daily_pnl_pct = (current_value / start_value - 1) * 100 if start_value > 0 else Decimal("0")
+    halted = daily_pnl_pct <= -DAILY_LOSS_LIMIT_PCT
+    return halted, daily_pnl_pct
+
+
+def _test_check_daily_loss_limit(tmp_path: str) -> None:
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+    try:
+        # first call today -> establishes the baseline, never halted on the same value
+        halted, pnl = check_daily_loss_limit(Decimal("1000"), tmp_path)
+        assert halted is False and pnl == 0, (halted, pnl)
+        # big drop from that baseline, same day -> halts
+        halted, pnl = check_daily_loss_limit(Decimal("880"), tmp_path)
+        assert halted is True and pnl == Decimal("-12"), (halted, pnl)
+        # small drop, same day -> doesn't halt
+        with open(tmp_path, "w") as f:
+            json.dump({"date": datetime.now(timezone.utc).date().isoformat(), "start_value": "1000"}, f)
+        halted, pnl = check_daily_loss_limit(Decimal("950"), tmp_path)
+        assert halted is False, (halted, pnl)
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+KILL_SWITCH_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "KILL_SWITCH")
+
+
+def kill_switch_active() -> bool:
+    """Manual emergency stop ('Futureproof Wealth' Ch.9 — explicit advice to
+    define a kill switch before running any automated strategy live).
+    Presence of the file halts NEW trade evaluation only; existing-position
+    management (early-exit, unprotected-leg re-hedge) keeps running so a
+    halted bot doesn't leave open risk unmanaged. `touch KILL_SWITCH` / `rm
+    KILL_SWITCH` to toggle, no restart needed."""
+    return os.path.exists(KILL_SWITCH_FILE)
 
 
 CONFIRM_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_top_candidate.json")
@@ -841,6 +1101,14 @@ def run_once() -> None:
     print("Checking open positions for early-exit opportunities...")
     manage_open_positions(client)
 
+    if kill_switch_active():
+        print(f"KILL_SWITCH active ({KILL_SWITCH_FILE}) — skipping new-trade evaluation this cycle. `rm {KILL_SWITCH_FILE}` to resume.")
+        return
+
+    fear_greed = get_fear_greed_index()  # macro overlay, fetched once per cycle, same for every candidate
+    if fear_greed is not None:
+        print(f"  Fear & Greed Index: {fear_greed}")
+
     print("Scanning whole Binance USDT market for new movers...")
     # get_binance_universe reads MAINNET (for real volume/discovery); testnet's
     # symbol list isn't 1:1 with mainnet's (e.g. leveraged tokens), so anything
@@ -892,6 +1160,24 @@ def run_once() -> None:
             print(f"  {sym} RSI {rsi:.1f} is overbought (>{RSI_OVERBOUGHT_THRESHOLD}), likely chasing an exhausted move.")
             continue
 
+        daily = get_binance_momentum_short([sym], window="1d").get(sym)
+        daily_pct = Decimal(str(daily["pct_change_24h"])) if daily else None
+        if is_counter_trend(daily_pct):
+            print(f"  {sym}: 1h signal fighting a bearish 24h trend ({daily_pct:+.1f}%), counter-trend, skipping.")
+            continue
+
+        current_price = Decimal(client.ticker_price(symbol=f"{sym}USDT")["price"])
+        vwap = get_vwap(sym)
+        vwap_dev = compute_vwap_deviation_pct(current_price, Decimal(str(vwap))) if vwap else None
+        if is_extended_from_vwap(vwap_dev):
+            print(f"  {sym}: price {vwap_dev:+.1f}% above rolling VWAP, overextended, likely to revert, skipping.")
+            continue
+
+        obv_div = get_obv_divergence(sym)
+        if obv_warns_against(obv_div):
+            print(f"  {sym}: {obv_div} OBV divergence — volume isn't confirming the price move, skipping.")
+            continue
+
         if (dex_scores.get(sym) or {}).get("pump_flag"):
             print(f"  {sym}: pump-signature detected (young/thin/spiking DEX pair) — flagged for the LLM.")
         kronos = get_kronos_forecast(sym)
@@ -905,22 +1191,29 @@ def run_once() -> None:
             continue
 
         kronos_pct = Decimal(str(kronos["predicted_pct_change"])) if kronos else None
-        opportunity = compute_opportunity_score(Decimal(str(verdict["confidence"])), kronos_pct)
+        opportunity = compute_opportunity_score(Decimal(str(verdict["confidence"])), kronos_pct, fear_greed=fear_greed)
         print(f"  Opportunity score: {opportunity['reasoning']}")
         if not opportunity["passes"]:
             print(f"  {sym}: opportunity score fails the Kronos+LLM blended gate.")
             continue
 
-        chosen = {"symbol": sym, "score": score, "verdict": verdict}
+        stop_loss_pct = compute_atr_stop_loss_pct(sym, current_price)
+        tp_pcts = compute_atr_take_profit_pcts(stop_loss_pct)
+        if not meets_min_reward_risk(tp_pcts[0], stop_loss_pct):
+            print(f"  {sym}: R:R {tp_pcts[0] / stop_loss_pct:.2f}:1 (TP1 {tp_pcts[0] * 100:.0f}% / stop "
+                  f"{stop_loss_pct * 100:.1f}%) below minimum {MIN_REWARD_RISK_RATIO}:1, skipping.")
+            continue
+
+        chosen = {"symbol": sym, "score": score, "verdict": verdict, "stop_loss_pct": stop_loss_pct, "tp_pcts": tp_pcts}
         break
 
     if chosen is None:
         print("No candidate this cycle cleared every gate.")
         return
     top_symbol, top_score, verdict = chosen["symbol"], chosen["score"], chosen["verdict"]
-
-    current_price = Decimal(client.ticker_price(symbol=f"{top_symbol}USDT")["price"])
-    stop_loss_pct = compute_atr_stop_loss_pct(top_symbol, current_price)
+    stop_loss_pct = chosen["stop_loss_pct"]
+    tp_pcts = chosen["tp_pcts"]
+    print(f"ATR-based take-profit legs: {[f'{p * 100:.1f}%' for p in tp_pcts]} (vs flat {[f'{p * 100:.0f}%' for p in LADDER_TP_PCTS]} default)")
     print(f"ATR-based stop-loss: {stop_loss_pct * 100:.1f}% (vs flat {DEFAULT_STOP_LOSS_PCT * 100:.0f}% default)")
 
     max_portfolio_pct = Decimal(os.environ.get("MAX_PORTFOLIO_PCT", "0.3"))
@@ -930,6 +1223,12 @@ def run_once() -> None:
     room = (max_portfolio_pct * total_value) - deployed_value
     print(f"Portfolio: ${total_value:.2f} total, ${deployed_value:.2f} deployed "
           f"({deployed_pct * 100:.1f}%, cap {max_portfolio_pct * 100:.0f}%)")
+
+    daily_halted, daily_pnl_pct = check_daily_loss_limit(total_value, DAILY_LOSS_FILE)
+    print(f"Today's P&L: {daily_pnl_pct:+.2f}% (limit -{DAILY_LOSS_LIMIT_PCT}%)")
+    if daily_halted:
+        print(f"Not betting — daily loss limit hit ({daily_pnl_pct:+.2f}% <= -{DAILY_LOSS_LIMIT_PCT}%). Resets at UTC midnight.")
+        return
 
     balance = get_usdt_balance(client)
 
@@ -948,7 +1247,7 @@ def run_once() -> None:
             bet_size = min(balance, golden_room, golden_per_trade_cap)
             print(f"GOLDEN TRADE — confidence {verdict['confidence']:.2f} >= {GOLDEN_CONFIDENCE_THRESHOLD}, "
                   f"betting {bet_size:.2f} from the golden reserve (1/{GOLDEN_SPLIT} of it, bypasses the normal per-trade cap).")
-            result = place_gamble_trade_laddered(client, top_symbol, bet_size, stop_loss_pct=stop_loss_pct)
+            result = place_gamble_trade_laddered(client, top_symbol, bet_size, tp_pcts=tp_pcts, stop_loss_pct=stop_loss_pct)
             _mark_golden_trade(result["trade_id"])
             _record_traded_symbol(top_symbol)
             print(f"\nBought {result['qty']} {top_symbol} @ ~{result['fill_price']}.")
@@ -996,7 +1295,7 @@ def run_once() -> None:
         return
     print(f"USDT balance: {balance}, betting: {bet_size:.2f} (1/{position_split} of cap, room left after: ${room - bet_size:.2f})")
 
-    result = place_gamble_trade_laddered(client, top_symbol, bet_size, stop_loss_pct=stop_loss_pct)
+    result = place_gamble_trade_laddered(client, top_symbol, bet_size, tp_pcts=tp_pcts, stop_loss_pct=stop_loss_pct)
     _record_traded_symbol(top_symbol)
     print(f"\nBought {result['qty']} {top_symbol} @ ~{result['fill_price']}.")
     for leg in result["legs"]:
@@ -1014,4 +1313,10 @@ if __name__ == "__main__":
     _test_golden_trade_marking(os.path.join(tempfile.gettempdir(), "_test_golden.json"))
     _test_compute_opportunity_score()
     _test_compute_atr_stop_loss_pct()
+    _test_meets_min_reward_risk()
+    _test_check_daily_loss_limit(os.path.join(tempfile.gettempdir(), "_test_daily_loss.json"))
+    _test_compute_atr_take_profit_pcts()
+    _test_is_counter_trend()
+    _test_vwap_deviation()
+    _test_obv_warns_against()
     run_once()

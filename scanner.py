@@ -208,6 +208,20 @@ def get_binance_momentum_short(symbols: list[str] = MEME_SYMBOLS, window: str = 
     return out
 
 
+def get_fear_greed_index() -> int | None:
+    """Crypto Fear & Greed Index (0-100), free, no key (alternative.me).
+    Contrarian macro overlay: extreme greed often precedes a top, extreme
+    fear often precedes a bottom ("be fearful when others are greedy, and
+    greedy when others are fearful"). None on a fetch failure — caller
+    treats that as neutral, not a block."""
+    try:
+        resp = requests.get("https://api.alternative.me/fng/", timeout=10)
+        resp.raise_for_status()
+        return int(resp.json()["data"][0]["value"])
+    except (requests.exceptions.RequestException, KeyError, IndexError, ValueError):
+        return None
+
+
 def get_market_breadth(momentum: dict[str, dict]) -> dict:
     """Regime signal from the same momentum dict already fetched for ranking
     (get_binance_momentum_short's output) — no extra API calls. up_pct/
@@ -317,6 +331,114 @@ def _test_compute_atr() -> None:
     flat = [(101.0, 99.0, 100.0) for _ in range(15)]
     assert abs(_compute_atr(flat) - 2.0) < 1e-9
     assert _compute_atr([(101.0, 99.0, 100.0)]) is None  # not enough candles
+
+
+def _compute_vwap(candles: list[tuple[float, float, float, float]]) -> float | None:
+    """Volume-weighted average price over `candles` — each a
+    (high, low, close, volume) tuple. Pure function; get_vwap() wraps it
+    with the actual candle fetch. Uses the typical price (H+L+C)/3 per
+    candle, standard VWAP convention. Acts as a "fair value" magnet price
+    tends to revert toward after stretching too far from it in either
+    direction ("Crypto Trading Strategies.md")."""
+    total_vol = sum(v for _, _, _, v in candles)
+    if total_vol == 0:
+        return None
+    return sum(((h + l + c) / 3) * v for h, l, c, v in candles) / total_vol
+
+
+def get_vwap(symbol: str, interval: str = "1h", period: int = 24) -> float | None:
+    """Rolling VWAP over the last `period` closed candles (24x 1h candles
+    by default, a rolling 24h VWAP). None on a fetch failure or zero
+    volume — caller treats that as "can't tell", not a block."""
+    try:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": f"{symbol}USDT", "interval": interval, "limit": period},
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException:
+        return None
+    candles = [(float(k[2]), float(k[3]), float(k[4]), float(k[5])) for k in resp.json()]  # high, low, close, volume
+    return _compute_vwap(candles)
+
+
+def _test_compute_vwap() -> None:
+    # flat price, any volume -> VWAP == that price
+    flat = [(101.0, 99.0, 100.0, 500.0) for _ in range(5)]
+    assert abs(_compute_vwap(flat) - 100.0) < 1e-9
+    # heavier volume candle should pull VWAP toward its price
+    mixed = [(11.0, 9.0, 10.0, 1.0), (21.0, 19.0, 20.0, 100.0)]
+    vwap = _compute_vwap(mixed)
+    assert 19.0 < vwap < 20.0, vwap
+    assert _compute_vwap([(101.0, 99.0, 100.0, 0.0)]) is None  # zero volume
+
+
+def _compute_obv(closes: list[float], volumes: list[float]) -> list[float]:
+    """On-Balance Volume: running total that adds a candle's volume on an
+    up close and subtracts it on a down close. Tracks whether volume is
+    net accumulating or distributing, independent of price."""
+    obv = [0.0]
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i - 1]:
+            obv.append(obv[-1] + volumes[i])
+        elif closes[i] < closes[i - 1]:
+            obv.append(obv[-1] - volumes[i])
+        else:
+            obv.append(obv[-1])
+    return obv
+
+
+def _detect_obv_divergence(closes: list[float], obv: list[float]) -> str | None:
+    """Compares the net price move to the net OBV move over the same
+    window. 'bullish': price fell but volume net accumulated (quiet
+    buying under a falling price — dip may not be real distribution).
+    'bearish': price rose but volume net distributed (the rally isn't
+    backed by buying volume — more fragile than it looks). None when
+    price and volume agree, or there's not enough history."""
+    if len(closes) < 2 or len(obv) < 2:
+        return None
+    price_trend = closes[-1] - closes[0]
+    obv_trend = obv[-1] - obv[0]
+    if price_trend < 0 and obv_trend > 0:
+        return "bullish"
+    if price_trend > 0 and obv_trend < 0:
+        return "bearish"
+    return None
+
+
+def get_obv_divergence(symbol: str, interval: str = "1h", period: int = 24) -> str | None:
+    """'bullish'/'bearish'/None divergence label over the last `period`
+    closed candles. None on a fetch failure too — caller treats that as
+    "can't tell", not a block."""
+    try:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": f"{symbol}USDT", "interval": interval, "limit": period},
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException:
+        return None
+    data = resp.json()
+    closes = [float(k[4]) for k in data]
+    volumes = [float(k[5]) for k in data]
+    return _detect_obv_divergence(closes, _compute_obv(closes, volumes))
+
+
+def _test_compute_obv() -> None:
+    obv = _compute_obv([10.0, 11.0, 10.0, 12.0], [100.0, 100.0, 100.0, 100.0])
+    assert obv == [0.0, 100.0, 0.0, 100.0], obv
+
+
+def _test_detect_obv_divergence() -> None:
+    # price falling, volume net accumulating -> bullish divergence
+    assert _detect_obv_divergence([10.0, 9.0, 8.0], [0.0, 50.0, 120.0]) == "bullish"
+    # price rising, volume net distributing -> bearish divergence
+    assert _detect_obv_divergence([10.0, 11.0, 12.0], [0.0, -50.0, -120.0]) == "bearish"
+    # price and volume agree -> no divergence
+    assert _detect_obv_divergence([10.0, 11.0, 12.0], [0.0, 50.0, 120.0]) is None
+    assert _detect_obv_divergence([10.0], [0.0]) is None
 
 
 def get_dexscreener_trend(symbol: str) -> dict | None:
@@ -638,14 +760,42 @@ def _test_describe_pump_risk() -> None:
     assert describe_pump_risk({"pump_flag": False}) == ""
 
 
-def get_text_sentiment(text: str) -> float:
-    """VADER compound sentiment score, -1 (bearish) to +1 (bullish). Free,
-    instant, no model download — tuned for short social-media-style text.
-    ponytail: crude general-purpose lexicon, not finance-specific — swap for
-    FinBERT (huggingface.co/ProsusAI/finbert) if this misreads crypto slang."""
+_FINBERT_SCRIPT = os.path.join(_KRONOS_DIR, "finbert_sentiment.py")
+
+
+def _get_vader_sentiment(text: str) -> float:
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
     return SentimentIntensityAnalyzer().polarity_scores(text)["compound"]
+
+
+def get_text_sentiment(text: str) -> float:
+    """FinBERT (huggingface.co/ProsusAI/finbert) compound sentiment score,
+    -1 (bearish) to +1 (bullish) — finance-domain-tuned, unlike a
+    general-purpose lexicon (academic literature review, IRJAEH paper in
+    trading-knowledge, confirms FinBERT beats lexicon methods on financial
+    text). Runs as a subprocess in kronos_venv (same venv Kronos already
+    needs torch in) since transformers isn't in the main venv. Falls back
+    to VADER (fast, no model, always available) on any failure — venv
+    missing, model load error, timeout — so this never blocks a caller."""
+    try:
+        result = subprocess.run(
+            [_KRONOS_PYTHON, _FINBERT_SCRIPT, text],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0:
+            return json.loads(result.stdout.strip())["compound"]
+    except Exception:
+        pass
+    return _get_vader_sentiment(text)
+
+
+def _test_get_text_sentiment() -> None:
+    bullish = get_text_sentiment("Huge bullish breakout, strong volume, major exchange listing incoming")
+    bearish = get_text_sentiment("Rug pull confirmed, team dumped, liquidity pulled, price crashing")
+    assert bullish > 0, bullish
+    assert bearish < 0, bearish
+    assert bullish > bearish
 
 
 def rank_symbols(
@@ -720,6 +870,10 @@ if __name__ == "__main__":
     _test_pump_signature()
     _test_compute_rsi()
     _test_compute_atr()
+    _test_compute_vwap()
+    _test_compute_obv()
+    _test_detect_obv_divergence()
+    _test_get_text_sentiment()
     _test_get_market_breadth()
     _test_describe_events()
     _test_describe_pump_risk()
@@ -754,7 +908,7 @@ if __name__ == "__main__":
     else:
         print("\nCoinMarketCap: skipped (no key)")
 
-    print("\nVADER sentiment on top pair's DEXScreener description:")
+    print("\nFinBERT sentiment on top pair's DEXScreener description:")
     for sym, _ in ranked[:2]:
         desc = (dex_scores.get(sym) or {}).get("description")
         if desc:

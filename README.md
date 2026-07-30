@@ -169,7 +169,9 @@ Needs **two separate Binance testnet accounts**: Spot testnet
 (`testnet.binance.vision`) for longs, USD-M Futures testnet
 (`testnet.binancefuture.com`, GitHub-login signup) for shorts. Kronos requires its
 own Python 3.10+ venv (`kronos_venv/`, not included — see `kronos_forecast.py`) with
-`shiyu-coder/Kronos` cloned locally.
+`shiyu-coder/Kronos` cloned locally. That same venv also runs FinBERT text
+sentiment (`pip install transformers`, see `finbert_sentiment.py`) — no
+separate venv needed, `torch` is already there for Kronos.
 
 Run once: `./venv/bin/python -m execute` (long) or `execute_futures` (short).
 Run continuously: `./venv/bin/python loop.py`.
