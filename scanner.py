@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import time
+from datetime import datetime, timedelta, timezone
 
 import requests
 
@@ -336,10 +337,20 @@ def get_dexscreener_trend(symbol: str) -> dict | None:
     if not pairs:
         return None
     top = max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd", 0))
+    liquidity = (top.get("liquidity") or {}).get("usd") or 0
+    volume_24h = (top.get("volume") or {}).get("h24") or 0
+    price_change_1h = (top.get("priceChange") or {}).get("h1")
+    created_at = top.get("pairCreatedAt")
+    age_hours = (time.time() * 1000 - created_at) / 3_600_000 if created_at else None
+    vol_liq_ratio = volume_24h / liquidity if liquidity else 0
     return {
         "pct_change_24h": (top.get("priceChange") or {}).get("h24"),
-        "volume_24h": (top.get("volume") or {}).get("h24"),
-        "liquidity_usd": (top.get("liquidity") or {}).get("usd"),
+        "pct_change_1h": price_change_1h,
+        "volume_24h": volume_24h,
+        "liquidity_usd": liquidity,
+        "age_hours": age_hours,
+        "vol_liq_ratio": round(vol_liq_ratio, 2),
+        "pump_flag": _pump_signature(age_hours, vol_liq_ratio, price_change_1h),
         "description": (top.get("info") or {}).get("description"),
     }
 
@@ -433,8 +444,61 @@ OLLAMA_VERDICT_SCHEMA = {
 }
 
 
+def describe_events(events: list[dict]) -> str:
+    """Explicit proximity logic instead of a bare title dump: an event within
+    48h is flagged as a near-term catalyst (buy-the-rumor / sell-the-news
+    risk — price often fades AFTER the event, not before), one further out
+    is background context only. Dates are ISO-8601 UTC per CoinMarketCal's
+    docs (`displayedDate` preferred over `date` when isEstimated is true);
+    a missing/unparseable date just falls back to a plain title list rather
+    than crashing — free-tier coverage is sparse and inconsistent."""
+    if not events:
+        return "No known upcoming catalyst events (or not covered by free-tier data)."
+    now = datetime.now(timezone.utc)
+    near, far = [], []
+    for e in events:
+        title = e.get("title") or "unnamed event"
+        date_str = e.get("displayedDate") if e.get("isEstimated") else e.get("date")
+        days_until = None
+        if date_str:
+            try:
+                event_dt = datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
+                days_until = (event_dt - now).total_seconds() / 86400
+            except ValueError:
+                pass
+        if days_until is not None and 0 <= days_until <= 2:
+            near.append(f"{title} (in {days_until:.1f}d)")
+        else:
+            far.append(title)
+    parts = []
+    if near:
+        parts.append(f"NEAR-TERM catalyst within 48h: {json.dumps(near)} — possible buy-the-rumor "
+                      "setup, price often fades right after the event fires, not before.")
+    if far:
+        parts.append(f"Other known events (background only): {json.dumps(far)}.")
+    return " ".join(parts)
+
+
+def describe_pump_risk(dex_data: dict | None) -> str:
+    """Explicit trading logic for the pump-signature heuristic instead of
+    leaving the LLM to infer it from raw numbers: young pair + high
+    volume/liquidity ratio + a strong 1h spike is the classic pump-and-dump
+    shape (thin market, easily moved, no organic depth behind the move)."""
+    if not dex_data or not dex_data.get("pump_flag"):
+        return ""
+    age = dex_data.get("age_hours")
+    age_note = f"{age:.1f}h old" if age is not None else "age unknown"
+    return (
+        f" PUMP-SIGNATURE WARNING: this pair is {age_note} with a "
+        f"{dex_data.get('vol_liq_ratio', 0):.1f}x volume/liquidity ratio and a "
+        f"{dex_data.get('pct_change_1h', 0):+.1f}% 1h move — classic thin-market pump shape, "
+        "treat any bullish read with extra skepticism."
+    )
+
+
 def get_llm_verdict(
-    symbol: str, signals: dict, model: str = "llama3.2:3b", kronos: dict | None = "unset"
+    symbol: str, signals: dict, model: str = "llama3.2:3b", kronos: dict | None = "unset",
+    dex_data: dict | None = None,
 ) -> dict | None:
     """Bull/bear reasoning over the ranked signals via a local Ollama model —
     free, no API key, no rate limit. `ollama pull llama3.2:3b` once first;
@@ -444,13 +508,11 @@ def get_llm_verdict(
     avoid a second subprocess call — callers that also need the raw forecast
     for their own scoring (see execute.py's compute_opportunity_score) fetch
     it once and pass it in here. Leave unset to fetch it internally as before.
+    `dex_data`: pass the symbol's already-fetched get_dexscreener_trend()
+    result to surface the pump-signature warning (describe_pump_risk).
     """
     events = get_coinmarketcal_events(symbol)
-    events_note = (
-        f"Upcoming catalyst events: {json.dumps([e.get('title') for e in events])}."
-        if events
-        else "No known upcoming catalyst events (or not covered by free-tier data)."
-    )
+    events_note = describe_events(events)
     if kronos == "unset":
         kronos = get_kronos_forecast(symbol)
     kronos_note = (
@@ -459,8 +521,9 @@ def get_llm_verdict(
         if kronos
         else "Kronos forecast unavailable this cycle."
     )
+    pump_note = describe_pump_risk(dex_data)
     prompt = (
-        f"Meme coin {symbol}. Signals: {json.dumps(signals)}. {events_note} {kronos_note} "
+        f"Meme coin {symbol}. Signals: {json.dumps(signals)}. {events_note} {kronos_note}{pump_note} "
         "This is a short-term momentum gamble on testnet, not an investment "
         "thesis — give your honest read on whether the momentum looks real "
         "(fresh, still building) or already exhausted (spiked and fading). "
@@ -506,13 +569,12 @@ def get_llm_short_verdict(
     momentum performer (not the best), asks whether the decline still has
     room to fall (short) or is already oversold/likely to bounce (skip).
     Same Ollama call shape, different framing and schema (short/skip instead
-    of buy/skip)."""
+    of buy/skip). No pump-signature note here — that heuristic requires a
+    strong positive 1h spike, which a worst-momentum candidate is
+    definitionally not showing; event proximity still applies, a near-term
+    positive catalyst is exactly what would blow up a short thesis."""
     events = get_coinmarketcal_events(symbol)
-    events_note = (
-        f"Upcoming catalyst events: {json.dumps([e.get('title') for e in events])}."
-        if events
-        else "No known upcoming catalyst events (or not covered by free-tier data)."
-    )
+    events_note = describe_events(events)
     if kronos == "unset":
         kronos = get_kronos_forecast(symbol)
     kronos_note = (
@@ -552,6 +614,30 @@ def get_llm_short_verdict(
     return None
 
 
+def _test_describe_events() -> None:
+    now = datetime.now(timezone.utc)
+    near_date = (now + timedelta(hours=10)).isoformat().replace("+00:00", "Z")
+    far_date = (now + timedelta(days=10)).isoformat().replace("+00:00", "Z")
+    events = [
+        {"title": "Mainnet launch", "date": near_date},
+        {"title": "Conference talk", "date": far_date},
+    ]
+    note = describe_events(events)
+    assert "NEAR-TERM" in note and "Mainnet launch" in note, note
+    assert "Conference talk" in note, note
+    assert describe_events([]) == "No known upcoming catalyst events (or not covered by free-tier data)."
+    # malformed date shouldn't crash — falls back to background-only listing
+    assert "Broken" in describe_events([{"title": "Broken", "date": "not-a-date"}])
+
+
+def _test_describe_pump_risk() -> None:
+    pumping = {"pump_flag": True, "age_hours": 10, "vol_liq_ratio": 5, "pct_change_1h": 40}
+    note = describe_pump_risk(pumping)
+    assert "PUMP-SIGNATURE WARNING" in note, note
+    assert describe_pump_risk(None) == ""
+    assert describe_pump_risk({"pump_flag": False}) == ""
+
+
 def get_text_sentiment(text: str) -> float:
     """VADER compound sentiment score, -1 (bearish) to +1 (bullish). Free,
     instant, no model download — tuned for short social-media-style text.
@@ -563,15 +649,20 @@ def get_text_sentiment(text: str) -> float:
 
 
 def rank_symbols(
-    momentum: dict[str, dict], dex_scores: dict[str, dict], trends: dict[str, int]
+    momentum: dict[str, dict], dex_scores: dict[str, dict], trends: dict[str, int],
+    cmc_movers: dict[str, float] | None = None,
 ) -> list[tuple[str, float]]:
     """Combine signals into one ranked list, highest score first.
 
     Score = 24h price change % (Binance) + 24h price change % (DEX, halved —
     DEX pairs are noisier/thinner liquidity) + Google Trends score (0-100,
-    scaled down 10x so it doesn't dominate). Pure function, no I/O — the
-    thing that's actually worth a self-check.
+    scaled down 10x so it doesn't dominate) + CoinMarketCap 24h % change
+    (scaled 0.3x, CONFIRMATION weight only — added when the symbol also
+    shows up in CMC's own top-100-by-24h-change list, i.e. the move is
+    visible market-wide and not a Binance-only anomaly). Pure function, no
+    I/O — the thing that's actually worth a self-check.
     """
+    cmc_movers = cmc_movers or {}
     scored = []
     for sym in momentum:
         score = momentum[sym]["pct_change_24h"]
@@ -579,6 +670,8 @@ def rank_symbols(
         if dex and dex.get("pct_change_24h") is not None:
             score += dex["pct_change_24h"] * 0.5
         score += trends.get(sym, 0) * 0.1
+        if sym in cmc_movers:
+            score += cmc_movers[sym] * 0.3
         scored.append((sym, round(score, 2)))
     return sorted(scored, key=lambda x: x[1], reverse=True)
 
@@ -602,6 +695,12 @@ def _test_rank_symbols() -> None:
     assert result[0][1] == 20.0, result
     assert result[1] == ("B", 12.0), f"expected B=2+100*0.1=12, got {result}"
 
+    # cmc_movers: confirmation bonus only for symbols CMC also flags
+    cmc = {"B": 10.0}  # B also shows up on CMC's own top-movers list
+    result_cmc = rank_symbols(momentum, dex, trends, cmc)
+    assert result_cmc[1] == ("B", 15.0), f"expected B=2+100*0.1+10*0.3=15, got {result_cmc}"
+    assert result_cmc[0] == ("A", 20.0), "A unaffected, not in cmc_movers"
+
 
 def _test_equal_profit_fractions() -> None:
     from decimal import Decimal
@@ -622,6 +721,8 @@ if __name__ == "__main__":
     _test_compute_rsi()
     _test_compute_atr()
     _test_get_market_breadth()
+    _test_describe_events()
+    _test_describe_pump_risk()
 
     print("Fetching Binance momentum...")
     momentum = get_binance_momentum()

@@ -30,10 +30,16 @@ from execute import _record_traded_symbol, _round_step, compute_atr_stop_loss_pc
 from scanner import (
     get_binance_momentum_short,
     get_binance_universe,
+    get_cmc_movers,
+    get_dexscreener_trend,
+    get_google_trends,
     get_kronos_forecast,
     get_llm_short_verdict,
     get_rsi,
+    rank_symbols,
 )
+
+DEX_ENRICH_TOP_N = 15  # how many worst-momentum symbols get the (slower) DEXScreener/Trends/CMC enrichment
 
 FUTURES_LEVERAGE = int(os.environ.get("FUTURES_LEVERAGE", "3"))
 FUTURES_MAX_PORTFOLIO_PCT = Decimal(os.environ.get("FUTURES_MAX_PORTFOLIO_PCT", "0.3"))
@@ -284,10 +290,26 @@ def run_once_short() -> None:
     max_price = float(os.environ.get("MAX_PRICE_USD", "5.0"))
     universe = get_binance_universe(max_price=max_price)
     momentum = get_binance_momentum_short(universe, window="1h")
-    ranked = sorted(momentum, key=lambda s: momentum[s]["pct_change_24h"])[:15]
-    if not ranked:
+
+    worst_by_momentum = sorted(momentum, key=lambda s: momentum[s]["pct_change_24h"])[:DEX_ENRICH_TOP_N]
+    if not worst_by_momentum:
         print("No candidates this cycle.")
         return
+    dex_scores = {sym: get_dexscreener_trend(sym) for sym in worst_by_momentum}
+    try:
+        trends = get_google_trends(worst_by_momentum)
+    except Exception as e:
+        print(f"  Google Trends skipped: {e}")
+        trends = {}
+    try:
+        cmc_movers = get_cmc_movers()
+    except Exception as e:
+        print(f"  CoinMarketCap movers skipped: {e}")
+        cmc_movers = {}
+    # rank_symbols sorts highest-score-first (long convention) — reverse it
+    # for shorts, since the most bearish combined score is what we want first
+    scored = rank_symbols({sym: momentum[sym] for sym in worst_by_momentum}, dex_scores, trends, cmc_movers)
+    ranked = [sym for sym, _ in reversed(scored)]
 
     prev_candidates = _load_worst_confirm_pool()
     _save_worst_confirm_pool(ranked)

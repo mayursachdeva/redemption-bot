@@ -21,7 +21,9 @@ from scanner import (
     get_atr,
     get_binance_momentum_short,
     get_binance_universe,
+    get_cmc_movers,
     get_dexscreener_trend,
+    get_google_trends,
     get_kronos_forecast,
     get_llm_verdict,
     get_market_breadth,
@@ -854,7 +856,17 @@ def run_once() -> None:
     # to run against the whole market, so only enrich the top-N by raw momentum first.
     top_by_momentum = sorted(momentum, key=lambda s: momentum[s]["pct_change_24h"], reverse=True)[:DEX_ENRICH_TOP_N]
     dex_scores = {sym: get_dexscreener_trend(sym) for sym in top_by_momentum}
-    ranked = rank_symbols({sym: momentum[sym] for sym in top_by_momentum}, dex_scores, {})
+    try:
+        trends = get_google_trends(top_by_momentum)
+    except Exception as e:
+        print(f"  Google Trends skipped: {e}")
+        trends = {}
+    try:
+        cmc_movers = get_cmc_movers()
+    except Exception as e:
+        print(f"  CoinMarketCap movers skipped: {e}")
+        cmc_movers = {}
+    ranked = rank_symbols({sym: momentum[sym] for sym in top_by_momentum}, dex_scores, trends, cmc_movers)
 
     prev_candidates = _load_confirm_pool()
     _save_confirm_pool([sym for sym, _ in ranked])
@@ -880,8 +892,10 @@ def run_once() -> None:
             print(f"  {sym} RSI {rsi:.1f} is overbought (>{RSI_OVERBOUGHT_THRESHOLD}), likely chasing an exhausted move.")
             continue
 
+        if (dex_scores.get(sym) or {}).get("pump_flag"):
+            print(f"  {sym}: pump-signature detected (young/thin/spiking DEX pair) — flagged for the LLM.")
         kronos = get_kronos_forecast(sym)
-        verdict = get_llm_verdict(sym, {"rank_score": score, **momentum[sym]}, kronos=kronos)
+        verdict = get_llm_verdict(sym, {"rank_score": score, **momentum[sym]}, kronos=kronos, dex_data=dex_scores.get(sym))
         if verdict is None:
             print("Ollama not running — `ollama serve` or open the app")
             return

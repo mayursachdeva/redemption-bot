@@ -1,3 +1,4 @@
 {"symbol": "BANK", "trade_id": "a3fc60ecb3", "qty": "5479", "entry": "0.1642300", "exit_price": 0.18907, "exit_reason": "early_exit_or_manual", "pnl_pct": -13.137991220183, "leverage": 3, "closed_at": "2026-07-30T07:14:16.688839+00:00"}
 {"symbol": "COTI", "trade_id": "70cc3d7943", "qty": "4051", "entry": "0.0163880", "exit_price": 0.018847, "exit_reason": "early_exit_or_manual", "pnl_pct": -13.04716931076564, "leverage": 3, "closed_at": "2026-07-30T07:14:18.207888+00:00"}
 {"symbol": "KAITO", "trade_id": "eeda7d4cc8", "qty": "172.0", "entry": "1.3083000", "exit_price": 1.1292, "exit_reason": "early_exit_or_manual", "pnl_pct": 15.860786397449521, "leverage": 3, "closed_at": "2026-07-30T10:45:24.971034+00:00"}
+{"symbol": "EPIC", "trade_id": "463e8efdee", "qty": "1043.8", "entry": "0.7295000", "exit_price": 0.8389, "exit_reason": "early_exit_or_manual", "pnl_pct": -13.040886875670521, "leverage": 3, "closed_at": "2026-07-30T14:34:17.734845+00:00"}
