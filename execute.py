@@ -24,6 +24,7 @@ from scanner import (
     get_cmc_movers,
     get_dexscreener_trend,
     get_fear_greed_index,
+    get_fibonacci_levels,
     get_google_trends,
     get_kronos_forecast,
     get_llm_verdict,
@@ -418,6 +419,45 @@ ATR_MULTIPLIER = Decimal(os.environ.get("ATR_MULTIPLIER", "2"))
 ATR_MIN_STOP_LOSS_PCT = Decimal(os.environ.get("ATR_MIN_STOP_LOSS_PCT", "0.08"))
 ATR_MAX_STOP_LOSS_PCT = Decimal(os.environ.get("ATR_MAX_STOP_LOSS_PCT", "0.25"))
 DEFAULT_STOP_LOSS_PCT = Decimal("0.15")  # fallback when ATR is unavailable this cycle
+FIB_STOP_BUFFER_PCT = Decimal(os.environ.get("FIB_STOP_BUFFER_PCT", "0.02"))
+
+
+def compute_fib_stop_loss_pct(symbol: str, price: Decimal, is_short: bool = False) -> Decimal | None:
+    """Stop-loss sized to the 61.8% Fibonacci retracement level (the
+    "golden ratio" invalidation level) instead of pure ATR volatility —
+    ties the stop to actual price structure. Pushed FIB_STOP_BUFFER_PCT
+    further out so the stop doesn't sit exactly on the level Fib traders
+    themselves watch (mirrors place_oco_exit's stop_price * 0.995 "hair
+    below the trigger" idea). Clamped to the same [ATR_MIN_STOP_LOSS_PCT,
+    ATR_MAX_STOP_LOSS_PCT] bounds ATR uses, so a distant swing can't
+    produce an outlier stop either. Returns None if Fibonacci levels
+    aren't available this cycle — caller falls back to
+    compute_atr_stop_loss_pct."""
+    if price <= 0:
+        return None
+    levels = get_fibonacci_levels(symbol, is_short=is_short)
+    if levels is None:
+        return None
+    level_61_8 = Decimal(str(levels["retracements"][61.8]))
+    raw_pct = abs(price - level_61_8) / price
+    buffered_pct = raw_pct * (1 + FIB_STOP_BUFFER_PCT)
+    return max(ATR_MIN_STOP_LOSS_PCT, min(ATR_MAX_STOP_LOSS_PCT, buffered_pct))
+
+
+def compute_fib_take_profit_pcts(symbol: str, price: Decimal, is_short: bool = False) -> tuple[Decimal, Decimal] | None:
+    """Take-profit legs sized to the 127.2% and 161.8% Fibonacci extension
+    levels instead of a flat multiple of the stop distance (ATR_TP_RATIO_1/2)
+    — independent of whatever stop_loss_pct ends up chosen. Returns None if
+    Fibonacci levels aren't available this cycle — caller falls back to
+    compute_atr_take_profit_pcts."""
+    if price <= 0:
+        return None
+    levels = get_fibonacci_levels(symbol, is_short=is_short)
+    if levels is None:
+        return None
+    tp1 = Decimal(str(levels["extensions"][127.2]))
+    tp2 = Decimal(str(levels["extensions"][161.8]))
+    return (abs(tp1 - price) / price, abs(tp2 - price) / price)
 
 
 def compute_atr_stop_loss_pct(symbol: str, price: Decimal) -> Decimal:
@@ -442,6 +482,18 @@ def _test_compute_atr_stop_loss_pct() -> None:
     assert compute_atr_stop_loss_pct("__NOPE__", Decimal("100")) == DEFAULT_STOP_LOSS_PCT
     # price <= 0 -> also falls back rather than dividing by zero
     assert compute_atr_stop_loss_pct("BTC", Decimal("0")) == DEFAULT_STOP_LOSS_PCT
+
+
+def _test_compute_fib_stop_loss_pct() -> None:
+    # bad symbol -> get_fibonacci_levels can't fetch -> None -> caller falls back to ATR
+    assert compute_fib_stop_loss_pct("__NOPE__", Decimal("100")) is None
+    # price <= 0 -> also None rather than dividing by zero
+    assert compute_fib_stop_loss_pct("BTC", Decimal("0")) is None
+
+
+def _test_compute_fib_take_profit_pcts() -> None:
+    assert compute_fib_take_profit_pcts("__NOPE__", Decimal("100")) is None
+    assert compute_fib_take_profit_pcts("BTC", Decimal("0")) is None
 
 
 SL_POLICY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sl_policy.json")
@@ -1437,6 +1489,8 @@ if __name__ == "__main__":
     _test_golden_trade_marking(os.path.join(tempfile.gettempdir(), "_test_golden.json"))
     _test_compute_opportunity_score()
     _test_compute_atr_stop_loss_pct()
+    _test_compute_fib_stop_loss_pct()
+    _test_compute_fib_take_profit_pcts()
     _test_use_fixed_stop_loss()
     _test_meets_min_reward_risk()
     _test_check_daily_loss_limit(os.path.join(tempfile.gettempdir(), "_test_daily_loss.json"))
