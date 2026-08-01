@@ -38,6 +38,7 @@ from execute import (
     is_counter_trend,
     is_extended_from_vwap,
     kill_switch_active,
+    use_fixed_stop_loss,
     make_trade_id,
     meets_min_reward_risk,
     obv_warns_against,
@@ -399,7 +400,7 @@ def run_once_short() -> None:
             print(f"  {sym}: opportunity score fails the gate.")
             continue
 
-        stop_loss_pct = compute_atr_stop_loss_pct(sym, current_price)
+        stop_loss_pct = FUTURES_STOP_LOSS_PCT if use_fixed_stop_loss() else compute_atr_stop_loss_pct(sym, current_price)
         take_profit_pct = compute_atr_take_profit_pcts(stop_loss_pct)[0]  # shorts aren't laddered, leg 1 only
         if not meets_min_reward_risk(take_profit_pct, stop_loss_pct):
             print(f"  {sym}: R:R {take_profit_pct / stop_loss_pct:.2f}:1 (TP {take_profit_pct * 100:.0f}% / "
