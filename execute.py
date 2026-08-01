@@ -1418,14 +1418,20 @@ def run_once() -> None:
             continue
 
         kronos_pct = Decimal(str(kronos["predicted_pct_change"])) if kronos else None
-        opportunity = compute_opportunity_score(Decimal(str(verdict["confidence"])), kronos_pct, fear_greed=fear_greed)
+        fib_score = fib_entry_signal(sym, current_price)
+        opportunity = compute_opportunity_score(
+            Decimal(str(verdict["confidence"])), kronos_pct, fear_greed=fear_greed, fib_score=fib_score,
+        )
         print(f"  Opportunity score: {opportunity['reasoning']}")
         if not opportunity["passes"]:
             print(f"  {sym}: opportunity score fails the Kronos+LLM blended gate.")
             continue
 
-        stop_loss_pct = DEFAULT_STOP_LOSS_PCT if use_fixed_stop_loss() else compute_atr_stop_loss_pct(sym, current_price)
-        tp_pcts = compute_atr_take_profit_pcts(stop_loss_pct)
+        if use_fixed_stop_loss():
+            stop_loss_pct = DEFAULT_STOP_LOSS_PCT
+        else:
+            stop_loss_pct = compute_fib_stop_loss_pct(sym, current_price) or compute_atr_stop_loss_pct(sym, current_price)
+        tp_pcts = compute_fib_take_profit_pcts(sym, current_price) or compute_atr_take_profit_pcts(stop_loss_pct)
         if not meets_min_reward_risk(tp_pcts[0], stop_loss_pct):
             print(f"  {sym}: R:R {tp_pcts[0] / stop_loss_pct:.2f}:1 (TP1 {tp_pcts[0] * 100:.0f}% / stop "
                   f"{stop_loss_pct * 100:.1f}%) below minimum {MIN_REWARD_RISK_RATIO}:1, skipping.")
