@@ -333,6 +333,89 @@ def _test_compute_atr() -> None:
     assert _compute_atr([(101.0, 99.0, 100.0)]) is None  # not enough candles
 
 
+def _test_compute_fibonacci_levels() -> None:
+    # long: swing from 100 (low) to 110 (high), span 10
+    candles = [(110.0, 100.0, 105.0) for _ in range(15)]
+    levels = _compute_fibonacci_levels(candles, is_short=False)
+    assert levels is not None
+    assert levels["swing_high"] == 110.0 and levels["swing_low"] == 100.0
+    # retracement measured DOWN from the high for a long
+    assert abs(levels["retracements"][61.8] - 103.82) < 1e-9, levels["retracements"][61.8]
+    assert abs(levels["retracements"][50.0] - 105.0) < 1e-9
+    # extension measured UP beyond the high for a long
+    assert abs(levels["extensions"][127.2] - 112.72) < 1e-9, levels["extensions"][127.2]
+    assert abs(levels["extensions"][161.8] - 116.18) < 1e-9
+
+    # short: same swing, mirrored — retracement UP from the low, extension DOWN beyond the low
+    levels_short = _compute_fibonacci_levels(candles, is_short=True)
+    assert abs(levels_short["retracements"][61.8] - 106.18) < 1e-9, levels_short["retracements"][61.8]
+    assert abs(levels_short["extensions"][127.2] - 97.28) < 1e-9, levels_short["extensions"][127.2]
+
+    # degenerate swing (flat price action, high == low) -> None
+    flat = [(100.0, 100.0, 100.0) for _ in range(15)]
+    assert _compute_fibonacci_levels(flat) is None
+
+    # thin history -> None
+    assert _compute_fibonacci_levels([(110.0, 100.0, 105.0)]) is None
+
+
+def _compute_fibonacci_levels(candles: list[tuple[float, float, float]], is_short: bool = False) -> dict | None:
+    """Fibonacci retracement + extension levels over `candles` — each a
+    (high, low, close) tuple, oldest first, same shape _compute_atr takes.
+    Pure function; get_fibonacci_levels() wraps it with the actual candle
+    fetch.
+
+    For a long (is_short=False): swing measured retracing DOWN from the
+    window's high toward its low (support levels below current price);
+    extensions measured UP beyond the high (profit targets above price).
+    For a short (is_short=True): mirrored — retracing UP from the low
+    toward the high (resistance above price); extensions DOWN beyond the
+    low (profit targets below price).
+
+    Returns None if there's less than a full period of candles, or the
+    swing is degenerate (high <= low, e.g. completely flat price action —
+    guards the division these levels feed downstream)."""
+    if len(candles) < 14:
+        return None
+    highs = [h for h, _, _ in candles]
+    lows = [l for _, l, _ in candles]
+    swing_high, swing_low = max(highs), min(lows)
+    if swing_high <= swing_low:
+        return None
+
+    span = swing_high - swing_low
+    retracement_ratios = (0.236, 0.382, 0.5, 0.618, 0.786)
+    extension_ratios = (1.272, 1.618)
+
+    if is_short:
+        retracements = {round(r * 100, 1): swing_low + span * r for r in retracement_ratios}
+        extensions = {round(r * 100, 1): swing_low - span * (r - 1) for r in extension_ratios}
+    else:
+        retracements = {round(r * 100, 1): swing_high - span * r for r in retracement_ratios}
+        extensions = {round(r * 100, 1): swing_high + span * (r - 1) for r in extension_ratios}
+
+    return {"swing_high": swing_high, "swing_low": swing_low, "retracements": retracements, "extensions": extensions}
+
+
+def get_fibonacci_levels(symbol: str, is_short: bool = False, interval: str = "1h", period: int = 14) -> dict | None:
+    """Fibonacci levels over the last `period` closed candles — same
+    fetch/compute split as get_atr, same default window (14x1h) so this
+    reuses the timeframe concept ATR already established rather than
+    introducing a second one. None on a fetch failure or degenerate swing;
+    caller falls back to the ATR-based stop/TP."""
+    try:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": f"{symbol}USDT", "interval": interval, "limit": period},
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException:
+        return None
+    candles = [(float(k[2]), float(k[3]), float(k[4])) for k in resp.json()]  # high, low, close
+    return _compute_fibonacci_levels(candles, is_short=is_short)
+
+
 def _compute_vwap(candles: list[tuple[float, float, float, float]]) -> float | None:
     """Volume-weighted average price over `candles` — each a
     (high, low, close, volume) tuple. Pure function; get_vwap() wraps it
@@ -870,6 +953,7 @@ if __name__ == "__main__":
     _test_pump_signature()
     _test_compute_rsi()
     _test_compute_atr()
+    _test_compute_fibonacci_levels()
     _test_compute_vwap()
     _test_compute_obv()
     _test_detect_obv_divergence()
