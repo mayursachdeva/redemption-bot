@@ -34,7 +34,10 @@ from execute import (
     check_daily_loss_limit,
     compute_atr_stop_loss_pct,
     compute_atr_take_profit_pcts,
+    compute_fib_stop_loss_pct,
+    compute_fib_take_profit_pcts,
     compute_vwap_deviation_pct,
+    fib_entry_signal,
     is_counter_trend,
     is_extended_from_vwap,
     kill_switch_active,
@@ -392,16 +395,21 @@ def run_once_short() -> None:
             continue
 
         kronos_pct = Decimal(str(kronos["predicted_pct_change"])) if kronos else None
+        fib_score = fib_entry_signal(sym, current_price, is_short=True)
         opportunity = compute_opportunity_score(
-            Decimal(str(verdict["confidence"])), kronos_pct, fear_greed=fear_greed, is_short=True,
+            Decimal(str(verdict["confidence"])), kronos_pct, fear_greed=fear_greed, is_short=True, fib_score=fib_score,
         )
         print(f"  Short opportunity score: {opportunity['reasoning']}")
         if not opportunity["passes"]:
             print(f"  {sym}: opportunity score fails the gate.")
             continue
 
-        stop_loss_pct = FUTURES_STOP_LOSS_PCT if use_fixed_stop_loss() else compute_atr_stop_loss_pct(sym, current_price)
-        take_profit_pct = compute_atr_take_profit_pcts(stop_loss_pct)[0]  # shorts aren't laddered, leg 1 only
+        if use_fixed_stop_loss():
+            stop_loss_pct = FUTURES_STOP_LOSS_PCT
+        else:
+            stop_loss_pct = compute_fib_stop_loss_pct(sym, current_price, is_short=True) or compute_atr_stop_loss_pct(sym, current_price)
+        fib_tp = compute_fib_take_profit_pcts(sym, current_price, is_short=True)
+        take_profit_pct = fib_tp[0] if fib_tp else compute_atr_take_profit_pcts(stop_loss_pct)[0]  # shorts aren't laddered, leg 1 only
         if not meets_min_reward_risk(take_profit_pct, stop_loss_pct):
             print(f"  {sym}: R:R {take_profit_pct / stop_loss_pct:.2f}:1 (TP {take_profit_pct * 100:.0f}% / "
                   f"stop {stop_loss_pct * 100:.1f}%) below minimum {MIN_REWARD_RISK_RATIO}:1, skipping.")
