@@ -460,6 +460,38 @@ def compute_fib_take_profit_pcts(symbol: str, price: Decimal, is_short: bool = F
     return (abs(tp1 - price) / price, abs(tp2 - price) / price)
 
 
+FIB_SIGNAL_NUDGE = Decimal(os.environ.get("FIB_SIGNAL_NUDGE", "0.1"))
+
+
+def fib_entry_signal(symbol: str, price: Decimal, is_short: bool = False) -> Decimal:
+    """Small additive nudge into compute_opportunity_score's fib_score —
+    same pattern and magnitude as the Fear & Greed nudge. Positive if price
+    is holding on the "structurally intact" side of the 50% retracement
+    (above it for a long, below it for a short); negative if price has
+    already broken past the 61.8% level in the wrong direction (structure
+    weakening, thesis in doubt). Neutral (0) if Fibonacci levels aren't
+    available this cycle — never blocks, mirrors how fear_greed=None means
+    no nudge in compute_opportunity_score."""
+    if price <= 0:
+        return Decimal("0")
+    levels = get_fibonacci_levels(symbol, is_short=is_short)
+    if levels is None:
+        return Decimal("0")
+    level_50 = Decimal(str(levels["retracements"][50.0]))
+    level_61_8 = Decimal(str(levels["retracements"][61.8]))
+    if is_short:
+        if price <= level_50:
+            return FIB_SIGNAL_NUDGE
+        if price >= level_61_8:
+            return -FIB_SIGNAL_NUDGE
+    else:
+        if price >= level_50:
+            return FIB_SIGNAL_NUDGE
+        if price <= level_61_8:
+            return -FIB_SIGNAL_NUDGE
+    return Decimal("0")
+
+
 def compute_atr_stop_loss_pct(symbol: str, price: Decimal) -> Decimal:
     """Volatility-adjusted stop, replacing one flat % for every symbol —
     Turtle-style: stop = ATR_MULTIPLIER x ATR, expressed as a fraction of
@@ -494,6 +526,11 @@ def _test_compute_fib_stop_loss_pct() -> None:
 def _test_compute_fib_take_profit_pcts() -> None:
     assert compute_fib_take_profit_pcts("__NOPE__", Decimal("100")) is None
     assert compute_fib_take_profit_pcts("BTC", Decimal("0")) is None
+
+
+def _test_fib_entry_signal() -> None:
+    assert fib_entry_signal("__NOPE__", Decimal("100")) == Decimal("0")
+    assert fib_entry_signal("BTC", Decimal("0")) == Decimal("0")
 
 
 SL_POLICY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sl_policy.json")
@@ -770,7 +807,7 @@ FEAR_GREED_NUDGE = Decimal(os.environ.get("FEAR_GREED_NUDGE", "0.1"))
 
 def compute_opportunity_score(
     llm_confidence: Decimal, kronos_pct: Decimal | None,
-    fear_greed: int | None = None, is_short: bool = False,
+    fear_greed: int | None = None, is_short: bool = False, fib_score: Decimal = Decimal("0"),
 ) -> dict:
     """Two independent confidence scores blended into one buy/no-buy gate,
     instead of the LLM's own confidence being the only thing that decides.
@@ -799,6 +836,10 @@ def compute_opportunity_score(
       so there's one implementation, not two to keep in sync). Flips which
       Kronos direction counts as "good" (bearish is good for a short) and
       which direction the veto fires on (bullish enough to risk a squeeze).
+    - fib_score: additive nudge from fib_entry_signal (see that function) —
+      structural confirmation from Fibonacci retracement levels, on the
+      same footing as the Fear & Greed nudge. Defaults to 0 (no effect) so
+      every existing caller keeps working unchanged.
     """
     if kronos_pct is None:
         kronos_score = Decimal("0")
@@ -807,7 +848,7 @@ def compute_opportunity_score(
         kronos_score = max(Decimal("-1"), min(Decimal("1"), signed_pct / KRONOS_NORMALIZE_PCT))
 
     llm_score = llm_confidence
-    opportunity_score = KRONOS_WEIGHT * kronos_score + LLM_WEIGHT * llm_score
+    opportunity_score = KRONOS_WEIGHT * kronos_score + LLM_WEIGHT * llm_score + fib_score
 
     fear_greed_note = ""
     if fear_greed is not None:
@@ -830,12 +871,13 @@ def compute_opportunity_score(
     veto_reason = (
         "bullish enough to risk a squeeze" if is_short else "bearish enough to fade"
     )
+    fib_note = f" Fib structure nudge {fib_score:+.2f}." if fib_score != 0 else ""
     reasoning = (
         f"Kronos: {kronos_score:+.2f} conviction ({direction}"
         + (f", predicts {kronos_pct:+.2f}%" if kronos_pct is not None else ", no forecast this cycle")
         + f") x weight {KRONOS_WEIGHT} = {KRONOS_WEIGHT * kronos_score:+.2f}. "
         f"LLM: {llm_score:.2f} confidence x weight {LLM_WEIGHT} = {LLM_WEIGHT * llm_score:+.2f}."
-        f"{fear_greed_note} "
+        f"{fear_greed_note}{fib_note} "
         f"Opportunity score {opportunity_score:+.2f} vs threshold {OPPORTUNITY_THRESHOLD} -> "
         + ("PASSES." if passes else f"FAILS" + (f" (Kronos veto — {veto_reason} regardless of LLM confidence)." if veto else "."))
     )
@@ -882,6 +924,15 @@ def _test_compute_opportunity_score() -> None:
     # is_short veto: bullish enough Kronos threatens a squeeze -> vetoed
     r = compute_opportunity_score(Decimal("0.90"), Decimal("8"), is_short=True)
     assert r["veto"] is True and r["passes"] is False, f"strongly bullish Kronos should veto a short, got {r}"
+
+    # fib structure nudge
+    base_fib = compute_opportunity_score(Decimal("0.60"), Decimal("1"))["opportunity_score"]
+    bullish_fib = compute_opportunity_score(Decimal("0.60"), Decimal("1"), fib_score=Decimal("0.1"))
+    assert bullish_fib["opportunity_score"] > base_fib, "positive fib_score should raise the opportunity score"
+    bearish_fib = compute_opportunity_score(Decimal("0.60"), Decimal("1"), fib_score=Decimal("-0.1"))
+    assert bearish_fib["opportunity_score"] < base_fib, "negative fib_score should lower the opportunity score"
+    neutral_fib = compute_opportunity_score(Decimal("0.60"), Decimal("1"), fib_score=Decimal("0"))
+    assert neutral_fib["opportunity_score"] == base_fib, "zero fib_score (the default) should be a no-op"
     print("compute_opportunity_score self-check OK")
 
 
@@ -1491,6 +1542,7 @@ if __name__ == "__main__":
     _test_compute_atr_stop_loss_pct()
     _test_compute_fib_stop_loss_pct()
     _test_compute_fib_take_profit_pcts()
+    _test_fib_entry_signal()
     _test_use_fixed_stop_loss()
     _test_meets_min_reward_risk()
     _test_check_daily_loss_limit(os.path.join(tempfile.gettempdir(), "_test_daily_loss.json"))
