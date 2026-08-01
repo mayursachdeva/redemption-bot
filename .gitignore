@@ -32,6 +32,7 @@ traded_symbols.json
 golden_trade_ids.json
 daily_loss_spot.json
 daily_loss_futures.json
+sl_policy.json
 KILL_SWITCH
 dashboard.html
 
