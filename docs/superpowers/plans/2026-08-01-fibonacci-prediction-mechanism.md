@@ -414,7 +414,9 @@ Expected: `NameError: name 'fib_entry_signal' is not defined`
 
 - [ ] **Step 3: Write the minimal implementation**
 
-In `execute.py`, add directly after `compute_fib_take_profit_pcts` (added in Task 2, right before `_test_compute_fib_stop_loss_pct`... actually before whichever test block follows — insert the function above its own test, i.e. directly after `compute_fib_take_profit_pcts`'s closing line and before `_test_compute_fib_stop_loss_pct`):
+Task 2 placed `compute_fib_take_profit_pcts` directly before the existing `def compute_atr_stop_loss_pct`, and placed its own tests (`_test_compute_fib_stop_loss_pct`/`_test_compute_fib_take_profit_pcts`) in a separate location — directly after the existing `_test_compute_atr_stop_loss_pct`. These two locations are NOT adjacent (the existing `compute_atr_stop_loss_pct` function and its test sit between them) — implement and test are placed separately, matching how `compute_atr_stop_loss_pct`/`_test_compute_atr_stop_loss_pct` already sit apart from each other elsewhere in the file.
+
+In `execute.py`, add `fib_entry_signal` directly after `compute_fib_take_profit_pcts`'s closing line (i.e. still directly before `def compute_atr_stop_loss_pct`):
 
 ```python
 FIB_SIGNAL_NUDGE = Decimal(os.environ.get("FIB_SIGNAL_NUDGE", "0.1"))
