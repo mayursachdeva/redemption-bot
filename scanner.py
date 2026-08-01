@@ -343,13 +343,14 @@ def _test_compute_fibonacci_levels() -> None:
     assert abs(levels["retracements"][61.8] - 103.82) < 1e-9, levels["retracements"][61.8]
     assert abs(levels["retracements"][50.0] - 105.0) < 1e-9
     # extension measured UP beyond the high for a long
-    assert abs(levels["extensions"][127.2] - 112.72) < 1e-9, levels["extensions"][127.2]
-    assert abs(levels["extensions"][161.8] - 116.18) < 1e-9
+    assert abs(levels["extensions"][161.8] - 116.18) < 1e-9, levels["extensions"][161.8]
+    assert abs(levels["extensions"][261.8] - 126.18) < 1e-9, levels["extensions"][261.8]
 
     # short: same swing, mirrored — retracement UP from the low, extension DOWN beyond the low
     levels_short = _compute_fibonacci_levels(candles, is_short=True)
     assert abs(levels_short["retracements"][61.8] - 106.18) < 1e-9, levels_short["retracements"][61.8]
-    assert abs(levels_short["extensions"][127.2] - 97.28) < 1e-9, levels_short["extensions"][127.2]
+    assert abs(levels_short["extensions"][161.8] - 93.82) < 1e-9, levels_short["extensions"][161.8]
+    assert abs(levels_short["extensions"][261.8] - 83.82) < 1e-9, levels_short["extensions"][261.8]
 
     # degenerate swing (flat price action, high == low) -> None
     flat = [(100.0, 100.0, 100.0) for _ in range(15)]
@@ -358,8 +359,14 @@ def _test_compute_fibonacci_levels() -> None:
     # thin history -> None
     assert _compute_fibonacci_levels([(110.0, 100.0, 105.0)]) is None
 
+    # period is honored now (previously hardcoded to 14 regardless of the
+    # period argument) — 5 candles with period=5 is a full window, not thin
+    five_candles = [(110.0, 100.0, 105.0) for _ in range(5)]
+    assert _compute_fibonacci_levels(five_candles, period=5) is not None
+    assert _compute_fibonacci_levels(five_candles, period=14) is None  # still thin for the default period
 
-def _compute_fibonacci_levels(candles: list[tuple[float, float, float]], is_short: bool = False) -> dict | None:
+
+def _compute_fibonacci_levels(candles: list[tuple[float, float, float]], is_short: bool = False, period: int = 14) -> dict | None:
     """Fibonacci retracement + extension levels over `candles` — each a
     (high, low, close) tuple, oldest first, same shape _compute_atr takes.
     Pure function; get_fibonacci_levels() wraps it with the actual candle
@@ -375,7 +382,7 @@ def _compute_fibonacci_levels(candles: list[tuple[float, float, float]], is_shor
     Returns None if there's less than a full period of candles, or the
     swing is degenerate (high <= low, e.g. completely flat price action —
     guards the division these levels feed downstream)."""
-    if len(candles) < 14:
+    if len(candles) < period:
         return None
     highs = [h for h, _, _ in candles]
     lows = [l for _, l, _ in candles]
@@ -385,7 +392,7 @@ def _compute_fibonacci_levels(candles: list[tuple[float, float, float]], is_shor
 
     span = swing_high - swing_low
     retracement_ratios = (0.236, 0.382, 0.5, 0.618, 0.786)
-    extension_ratios = (1.272, 1.618)
+    extension_ratios = (1.618, 2.618)
 
     if is_short:
         retracements = {round(r * 100, 1): swing_low + span * r for r in retracement_ratios}
@@ -397,12 +404,13 @@ def _compute_fibonacci_levels(candles: list[tuple[float, float, float]], is_shor
     return {"swing_high": swing_high, "swing_low": swing_low, "retracements": retracements, "extensions": extensions}
 
 
-def get_fibonacci_levels(symbol: str, is_short: bool = False, interval: str = "1h", period: int = 14) -> dict | None:
-    """Fibonacci levels over the last `period` closed candles — same
-    fetch/compute split as get_atr, same default window (14x1h) so this
-    reuses the timeframe concept ATR already established rather than
-    introducing a second one. None on a fetch failure or degenerate swing;
-    caller falls back to the ATR-based stop/TP."""
+def get_fibonacci_levels(symbol: str, is_short: bool = False, interval: str = "1d", period: int = 14) -> dict | None:
+    """Fibonacci levels over the last `period` closed candles — 14x1d (a
+    14-day lookback) by default. Widened from an earlier 14x1h window: that
+    window was too small to clear ATR_MIN_STOP_LOSS_PCT's 8% floor in the
+    large majority of live candidates (2026-08-01 whole-branch review),
+    defeating the "anchor to real structure" goal. None on a fetch failure
+    or degenerate swing; caller falls back to the ATR-based stop/TP."""
     try:
         resp = requests.get(
             "https://api.binance.com/api/v3/klines",
@@ -413,7 +421,7 @@ def get_fibonacci_levels(symbol: str, is_short: bool = False, interval: str = "1
     except requests.exceptions.RequestException:
         return None
     candles = [(float(k[2]), float(k[3]), float(k[4])) for k in resp.json()]  # high, low, close
-    return _compute_fibonacci_levels(candles, is_short=is_short)
+    return _compute_fibonacci_levels(candles, is_short=is_short, period=period)
 
 
 def _compute_vwap(candles: list[tuple[float, float, float, float]]) -> float | None:

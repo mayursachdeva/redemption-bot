@@ -420,44 +420,65 @@ ATR_MIN_STOP_LOSS_PCT = Decimal(os.environ.get("ATR_MIN_STOP_LOSS_PCT", "0.08"))
 ATR_MAX_STOP_LOSS_PCT = Decimal(os.environ.get("ATR_MAX_STOP_LOSS_PCT", "0.25"))
 DEFAULT_STOP_LOSS_PCT = Decimal("0.15")  # fallback when ATR is unavailable this cycle
 FIB_STOP_BUFFER_PCT = Decimal(os.environ.get("FIB_STOP_BUFFER_PCT", "0.02"))
+FIB_MAX_SCALE_FACTOR = Decimal(os.environ.get("FIB_MAX_SCALE_FACTOR", "3"))
 
 
-def compute_fib_stop_loss_pct(symbol: str, price: Decimal, is_short: bool = False) -> Decimal | None:
-    """Stop-loss sized to the 61.8% Fibonacci retracement level (the
-    "golden ratio" invalidation level) instead of pure ATR volatility —
-    ties the stop to actual price structure. Pushed FIB_STOP_BUFFER_PCT
-    further out so the stop doesn't sit exactly on the level Fib traders
-    themselves watch (mirrors place_oco_exit's stop_price * 0.995 "hair
-    below the trigger" idea). Clamped to the same [ATR_MIN_STOP_LOSS_PCT,
-    ATR_MAX_STOP_LOSS_PCT] bounds ATR uses, so a distant swing can't
-    produce an outlier stop either. Returns None if Fibonacci levels
-    aren't available this cycle — caller falls back to
-    compute_atr_stop_loss_pct."""
+def compute_fib_stop_loss_pct(symbol: str, price: Decimal, is_short: bool = False) -> tuple[Decimal, Decimal] | None:
+    """Stop-loss sized to the 23.6% Fibonacci retracement level instead of
+    pure ATR volatility — ties the stop to actual price structure. Pushed
+    FIB_STOP_BUFFER_PCT further out so the stop doesn't sit exactly on the
+    level Fib traders themselves watch (mirrors place_oco_exit's
+    stop_price * 0.995 "hair below the trigger" idea).
+
+    Returns (stop_loss_pct, scale_factor): stop_loss_pct is clamped to
+    [ATR_MIN_STOP_LOSS_PCT, ATR_MAX_STOP_LOSS_PCT] as before; scale_factor
+    is how much that clamp stretched the raw (pre-clamp) distance — 1.0
+    when the clamp didn't bind. compute_fib_take_profit_pcts stretches its
+    own legs by this same factor so the bracket's ratio survives clamping
+    intact (2026-08-01 whole-branch review, second pass).
+
+    If scale_factor would exceed FIB_MAX_SCALE_FACTOR (default 3x, mirroring
+    ATR_MAX_STOP_LOSS_PCT/ATR_MIN_STOP_LOSS_PCT's own 3.125x range), this
+    returns None instead of an inflated pair: price sitting that close to
+    the 23.6% level carries no real structural meaning, and force-scaling
+    produced take-profits over 600% away that still passed the R:R gate
+    (2026-08-01 whole-branch review, third pass — measured live up to
+    104x scale / 647% TP / 80:1 "ratio" that the gate couldn't catch,
+    since both sides of the ratio were inflated together). Returns None on
+    a fetch failure or an over-cap scale — caller falls back to
+    compute_atr_stop_loss_pct (and compute_atr_take_profit_pcts, together
+    — never mix a Fib stop with an ATR take-profit or vice versa)."""
     if price <= 0:
         return None
     levels = get_fibonacci_levels(symbol, is_short=is_short)
     if levels is None:
         return None
-    level_61_8 = Decimal(str(levels["retracements"][61.8]))
-    raw_pct = abs(price - level_61_8) / price
+    level_23_6 = Decimal(str(levels["retracements"][23.6]))
+    raw_pct = abs(price - level_23_6) / price
     buffered_pct = raw_pct * (1 + FIB_STOP_BUFFER_PCT)
-    return max(ATR_MIN_STOP_LOSS_PCT, min(ATR_MAX_STOP_LOSS_PCT, buffered_pct))
+    clamped_pct = max(ATR_MIN_STOP_LOSS_PCT, min(ATR_MAX_STOP_LOSS_PCT, buffered_pct))
+    scale = clamped_pct / buffered_pct if buffered_pct > 0 else Decimal("1")
+    if scale > FIB_MAX_SCALE_FACTOR:
+        return None
+    return (clamped_pct, scale)
 
 
-def compute_fib_take_profit_pcts(symbol: str, price: Decimal, is_short: bool = False) -> tuple[Decimal, Decimal] | None:
-    """Take-profit legs sized to the 127.2% and 161.8% Fibonacci extension
-    levels instead of a flat multiple of the stop distance (ATR_TP_RATIO_1/2)
-    — independent of whatever stop_loss_pct ends up chosen. Returns None if
-    Fibonacci levels aren't available this cycle — caller falls back to
-    compute_atr_take_profit_pcts."""
+def compute_fib_take_profit_pcts(symbol: str, price: Decimal, scale: Decimal, is_short: bool = False) -> tuple[Decimal, Decimal] | None:
+    """Take-profit legs sized to the 161.8%/261.8% Fibonacci extension
+    levels, stretched by `scale` (see compute_fib_stop_loss_pct) so the
+    stop/take-profit pair's ratio survives the stop's ATR-bound clamping
+    intact. Always pass the scale_factor returned alongside the paired
+    stop — never call this with a scale from a different symbol/cycle.
+    Returns None if Fibonacci levels aren't available this cycle — caller
+    falls back to compute_atr_take_profit_pcts."""
     if price <= 0:
         return None
     levels = get_fibonacci_levels(symbol, is_short=is_short)
     if levels is None:
         return None
-    tp1 = Decimal(str(levels["extensions"][127.2]))
-    tp2 = Decimal(str(levels["extensions"][161.8]))
-    return (abs(tp1 - price) / price, abs(tp2 - price) / price)
+    tp1 = Decimal(str(levels["extensions"][161.8]))
+    tp2 = Decimal(str(levels["extensions"][261.8]))
+    return (abs(tp1 - price) / price * scale, abs(tp2 - price) / price * scale)
 
 
 FIB_SIGNAL_NUDGE = Decimal(os.environ.get("FIB_SIGNAL_NUDGE", "0.1"))
@@ -521,11 +542,21 @@ def _test_compute_fib_stop_loss_pct() -> None:
     assert compute_fib_stop_loss_pct("__NOPE__", Decimal("100")) is None
     # price <= 0 -> also None rather than dividing by zero
     assert compute_fib_stop_loss_pct("BTC", Decimal("0")) is None
+    # price sitting a hair off the 23.6% level -> raw distance far under the
+    # ATR_MIN_STOP_LOSS_PCT floor -> the clamp's scale factor blows past
+    # FIB_MAX_SCALE_FACTOR -> None rather than an inflated pair (2026-08-01
+    # review, third pass: unbounded scale reached 104x, producing 647%
+    # take-profits that still passed the R:R gate because the inflated TP
+    # inflated the ratio too)
+    levels = get_fibonacci_levels("BTC")
+    if levels is not None:  # skip when the klines fetch is unavailable
+        near_level = Decimal(str(levels["retracements"][23.6])) * Decimal("1.005")
+        assert compute_fib_stop_loss_pct("BTC", near_level) is None
 
 
 def _test_compute_fib_take_profit_pcts() -> None:
-    assert compute_fib_take_profit_pcts("__NOPE__", Decimal("100")) is None
-    assert compute_fib_take_profit_pcts("BTC", Decimal("0")) is None
+    assert compute_fib_take_profit_pcts("__NOPE__", Decimal("100"), Decimal("1")) is None
+    assert compute_fib_take_profit_pcts("BTC", Decimal("0"), Decimal("1")) is None
 
 
 def _test_fib_entry_signal() -> None:
@@ -1367,6 +1398,7 @@ def run_once() -> None:
     _save_confirm_pool([sym for sym, _ in ranked])
     open_symbols = {p["symbol"] for p in get_open_positions(client)}
 
+    fixed_sl_active = use_fixed_stop_loss()  # checked once per cycle, not once per candidate — it's a network call with a state-mutating side effect (2026-08-01 whole-branch review, Important #5)
     chosen = None
     for sym, score in ranked:
         if not has_ask_liquidity(client, sym):
@@ -1427,17 +1459,35 @@ def run_once() -> None:
             print(f"  {sym}: opportunity score fails the Kronos+LLM blended gate.")
             continue
 
-        if use_fixed_stop_loss():
+        if fixed_sl_active:
+            # fixed-SL still wins over Fib for BOTH sides of the bracket, not
+            # just the stop — pairing a flat stop with a structurally
+            # independent Fib take-profit broke the drawdown-recovery
+            # policy's original guaranteed-ratio behavior (2026-08-01
+            # whole-branch review, Important #3).
             stop_loss_pct = DEFAULT_STOP_LOSS_PCT
+            tp_pcts = compute_atr_take_profit_pcts(stop_loss_pct)
+            sl_source, tp_source = "flat", "ATR-ratio (fixed-SL active)"
         else:
-            stop_loss_pct = compute_fib_stop_loss_pct(sym, current_price) or compute_atr_stop_loss_pct(sym, current_price)
-        tp_pcts = compute_fib_take_profit_pcts(sym, current_price) or compute_atr_take_profit_pcts(stop_loss_pct)
+            fib_sl = compute_fib_stop_loss_pct(sym, current_price)
+            fib_tp = compute_fib_take_profit_pcts(sym, current_price, fib_sl[1]) if fib_sl is not None else None
+            if fib_sl is not None and fib_tp is not None:
+                stop_loss_pct = fib_sl[0]
+                tp_pcts = fib_tp
+                sl_source, tp_source = "Fib", "Fib"
+            else:
+                stop_loss_pct = compute_atr_stop_loss_pct(sym, current_price)
+                tp_pcts = compute_atr_take_profit_pcts(stop_loss_pct)
+                sl_source, tp_source = "ATR", "ATR"
         if not meets_min_reward_risk(tp_pcts[0], stop_loss_pct):
             print(f"  {sym}: R:R {tp_pcts[0] / stop_loss_pct:.2f}:1 (TP1 {tp_pcts[0] * 100:.0f}% / stop "
                   f"{stop_loss_pct * 100:.1f}%) below minimum {MIN_REWARD_RISK_RATIO}:1, skipping.")
             continue
 
-        chosen = {"symbol": sym, "score": score, "verdict": verdict, "stop_loss_pct": stop_loss_pct, "tp_pcts": tp_pcts}
+        chosen = {
+            "symbol": sym, "score": score, "verdict": verdict, "stop_loss_pct": stop_loss_pct,
+            "tp_pcts": tp_pcts, "sl_source": sl_source, "tp_source": tp_source,
+        }
         break
 
     if chosen is None:
@@ -1446,8 +1496,8 @@ def run_once() -> None:
     top_symbol, top_score, verdict = chosen["symbol"], chosen["score"], chosen["verdict"]
     stop_loss_pct = chosen["stop_loss_pct"]
     tp_pcts = chosen["tp_pcts"]
-    print(f"ATR-based take-profit legs: {[f'{p * 100:.1f}%' for p in tp_pcts]} (vs flat {[f'{p * 100:.0f}%' for p in LADDER_TP_PCTS]} default)")
-    print(f"ATR-based stop-loss: {stop_loss_pct * 100:.1f}% (vs flat {DEFAULT_STOP_LOSS_PCT * 100:.0f}% default)")
+    print(f"{chosen['tp_source']}-based take-profit legs: {[f'{p * 100:.1f}%' for p in tp_pcts]}")
+    print(f"{chosen['sl_source']}-based stop-loss: {stop_loss_pct * 100:.1f}%")
 
     max_portfolio_pct = Decimal(os.environ.get("MAX_PORTFOLIO_PCT", "0.3"))
     position_split = int(os.environ.get("POSITION_SPLIT", "5"))

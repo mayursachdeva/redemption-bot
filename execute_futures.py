@@ -348,6 +348,7 @@ def run_once_short() -> None:
 
     from execute import compute_opportunity_score
 
+    fixed_sl_active = use_fixed_stop_loss()  # checked once per cycle, not once per candidate — see execute.py's mirrored comment
     chosen = None
     for sym in ranked:
         score = momentum[sym]["pct_change_24h"]
@@ -404,18 +405,32 @@ def run_once_short() -> None:
             print(f"  {sym}: opportunity score fails the gate.")
             continue
 
-        if use_fixed_stop_loss():
+        if fixed_sl_active:
+            # fixed-SL still wins over Fib for BOTH sides of the bracket, not
+            # just the stop — see execute.py's mirrored comment for why.
             stop_loss_pct = FUTURES_STOP_LOSS_PCT
+            take_profit_pct = compute_atr_take_profit_pcts(stop_loss_pct)[0]
+            sl_source, tp_source = "flat", "ATR-ratio (fixed-SL active)"
         else:
-            stop_loss_pct = compute_fib_stop_loss_pct(sym, current_price, is_short=True) or compute_atr_stop_loss_pct(sym, current_price)
-        fib_tp = compute_fib_take_profit_pcts(sym, current_price, is_short=True)
-        take_profit_pct = fib_tp[0] if fib_tp else compute_atr_take_profit_pcts(stop_loss_pct)[0]  # shorts aren't laddered, leg 1 only
+            fib_sl = compute_fib_stop_loss_pct(sym, current_price, is_short=True)
+            fib_tp = compute_fib_take_profit_pcts(sym, current_price, fib_sl[1], is_short=True) if fib_sl is not None else None
+            if fib_sl is not None and fib_tp is not None:
+                stop_loss_pct = fib_sl[0]
+                take_profit_pct = fib_tp[0]  # shorts aren't laddered, leg 1 only
+                sl_source, tp_source = "Fib", "Fib"
+            else:
+                stop_loss_pct = compute_atr_stop_loss_pct(sym, current_price)
+                take_profit_pct = compute_atr_take_profit_pcts(stop_loss_pct)[0]
+                sl_source, tp_source = "ATR", "ATR"
         if not meets_min_reward_risk(take_profit_pct, stop_loss_pct):
             print(f"  {sym}: R:R {take_profit_pct / stop_loss_pct:.2f}:1 (TP {take_profit_pct * 100:.0f}% / "
                   f"stop {stop_loss_pct * 100:.1f}%) below minimum {MIN_REWARD_RISK_RATIO}:1, skipping.")
             continue
 
-        chosen = {"symbol": sym, "score": score, "verdict": verdict, "stop_loss_pct": stop_loss_pct, "take_profit_pct": take_profit_pct}
+        chosen = {
+            "symbol": sym, "score": score, "verdict": verdict, "stop_loss_pct": stop_loss_pct,
+            "take_profit_pct": take_profit_pct, "sl_source": sl_source, "tp_source": tp_source,
+        }
         break
 
     if chosen is None:
@@ -453,8 +468,8 @@ def run_once_short() -> None:
         return
 
     exchange_info = client.exchange_info()
-    print(f"ATR-based stop-loss: {stop_loss_pct * 100:.1f}% (vs flat {FUTURES_STOP_LOSS_PCT * 100:.0f}% default)")
-    print(f"ATR-based take-profit: {take_profit_pct * 100:.1f}% (vs flat {FUTURES_TAKE_PROFIT_PCT * 100:.0f}% default)")
+    print(f"{chosen['sl_source']}-based stop-loss: {stop_loss_pct * 100:.1f}%")
+    print(f"{chosen['tp_source']}-based take-profit: {take_profit_pct * 100:.1f}%")
     result = open_short(client, exchange_info, worst_symbol, margin, leverage=FUTURES_LEVERAGE,
                          stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct)
     print(f"\nShorted {result['qty']} {worst_symbol} @ ~{result['entry_price']} "
