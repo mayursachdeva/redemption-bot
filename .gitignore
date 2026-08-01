@@ -35,6 +35,7 @@ daily_loss_futures.json
 sl_policy.json
 KILL_SWITCH
 dashboard.html
+quantstats_report.html
 
 # macOS
 .DS_Store

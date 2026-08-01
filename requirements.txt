@@ -6,3 +6,4 @@ binance-connector
 
 telethon
 binance-futures-connector
+quantstats
