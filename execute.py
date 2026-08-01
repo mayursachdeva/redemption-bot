@@ -444,6 +444,130 @@ def _test_compute_atr_stop_loss_pct() -> None:
     assert compute_atr_stop_loss_pct("BTC", Decimal("0")) == DEFAULT_STOP_LOSS_PCT
 
 
+SL_POLICY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sl_policy.json")
+
+
+def _current_unrealized_pnl() -> Decimal:
+    """Live unrealized $ pnl across spot + futures right now. Local-imports
+    execute_futures (which itself imports from this module) to avoid a
+    circular import at load time. Returns 0 if credentials/env aren't
+    loaded — callers treat that as "no unrealized info available", not
+    "no open positions"."""
+    from execute_futures import get_futures_client, get_open_short_positions
+
+    total = Decimal(0)
+    try:
+        for r in get_open_positions(get_client()):
+            if r["entry"] is not None:
+                total += r["qty"] * (r["current"] - r["entry"])
+        for r in get_open_short_positions(get_futures_client()):
+            total += r["qty"] * (r["entry"] - r["current"])
+    except Exception as e:
+        print(f"  (fixed-SL check: couldn't fetch live unrealized — {e})")
+    return total
+
+
+def activate_fixed_stop_loss() -> None:
+    """Force flat DEFAULT_STOP_LOSS_PCT/FUTURES_STOP_LOSS_PCT on new trades
+    instead of the ATR-scaled stop, until net $ pnl CHANGE since activation
+    (realized pnl from trades closed after this point, plus the move in the
+    currently-open book's unrealized value relative to its value right now)
+    turns positive again. Snapshots today's unrealized as a baseline — the
+    pre-existing open book's value at activation must not itself count as
+    "profit since activation", only its change from here. Manual override
+    after a run of wide ATR stops (the MMT 25%-stop loss, 2026-07-31) ate an
+    outsized chunk of capital in one trade — see use_fixed_stop_loss."""
+    with open(SL_POLICY_FILE, "w") as f:
+        json.dump({
+            "activated_at": datetime.now(timezone.utc).isoformat(),
+            "baseline_unrealized": str(_current_unrealized_pnl()),
+        }, f)
+
+
+def _realized_pnl_since(since: str) -> Decimal:
+    """Realized $ pnl from both journals for trades closed_at >= since."""
+    from execute_futures import SHORT_JOURNAL_FILE
+
+    total = Decimal(0)
+    for path, is_short in ((TRADE_JOURNAL_FILE, False), (SHORT_JOURNAL_FILE, True)):
+        if not os.path.exists(path):
+            continue
+        with open(path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                r = json.loads(line)
+                if r.get("pnl_pct") is None or r["closed_at"] < since:
+                    continue
+                qty, entry, exitp = Decimal(str(r["qty"])), Decimal(str(r["entry"])), Decimal(str(r["exit_price"]))
+                total += qty * (entry - exitp) if is_short else qty * (exitp - entry)
+    return total
+
+
+def use_fixed_stop_loss() -> bool:
+    """True while the fixed-SL policy (see activate_fixed_stop_loss) is active
+    and the account hasn't recovered to a net positive CHANGE since activation
+    yet (realized-since + unrealized-now-vs-baseline). Self-deactivates
+    (deletes the state file) the moment it finds recovery — flips back to
+    ATR-scaled stops automatically, no manual step to turn it back off."""
+    if not os.path.exists(SL_POLICY_FILE):
+        return False
+    with open(SL_POLICY_FILE) as f:
+        policy = json.load(f)
+    realized = _realized_pnl_since(policy["activated_at"])
+    unrealized_change = _current_unrealized_pnl() - Decimal(policy["baseline_unrealized"])
+    net = realized + unrealized_change
+    if net > 0:  # strictly positive — a flat 0 (no change yet) must not read as "recovered"
+        print(f"  fixed-SL policy: net change since activation is {net:+.2f} USDT — back in profit, reverting to ATR stops.")
+        os.remove(SL_POLICY_FILE)
+        return False
+    print(f"  fixed-SL policy active: net change since activation is {net:+.2f} USDT — still using flat stop.")
+    return True
+
+
+def _test_use_fixed_stop_loss() -> None:
+    import tempfile
+    import execute as _execute_module
+
+    global SL_POLICY_FILE
+    original_file = SL_POLICY_FILE
+    original_unrealized = _execute_module._current_unrealized_pnl
+    original_realized = _execute_module._realized_pnl_since
+    fd, SL_POLICY_FILE = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    os.remove(SL_POLICY_FILE)  # exists()-check should treat a missing file as inactive
+    try:
+        assert use_fixed_stop_loss() is False  # no policy file -> ATR mode as normal
+
+        # pre-existing open book is worth +200 unrealized at the moment we flip
+        # the switch — that +200 must NOT itself count as "profit since
+        # activation" once the policy is live (this was the real bug: the
+        # first version folded the whole current unrealized snapshot in as if
+        # it were new, so it self-deactivated the instant it was turned on).
+        _execute_module._current_unrealized_pnl = lambda: Decimal("200")
+        activate_fixed_stop_loss()
+        assert os.path.exists(SL_POLICY_FILE)
+        _execute_module._realized_pnl_since = lambda since: Decimal("0")
+        assert use_fixed_stop_loss() is True  # no change yet -> stays active despite +200 baseline
+        assert os.path.exists(SL_POLICY_FILE)
+
+        # book unrealized dropped further, no new trades closed -> still active
+        _execute_module._current_unrealized_pnl = lambda: Decimal("150")
+        assert use_fixed_stop_loss() is True
+        assert os.path.exists(SL_POLICY_FILE)
+
+        # book recovers back above the +200 baseline -> net change positive -> reverts
+        _execute_module._current_unrealized_pnl = lambda: Decimal("201")
+        assert use_fixed_stop_loss() is False
+        assert not os.path.exists(SL_POLICY_FILE)  # self-deactivated
+    finally:
+        _execute_module._current_unrealized_pnl = original_unrealized
+        _execute_module._realized_pnl_since = original_realized
+        if os.path.exists(SL_POLICY_FILE):
+            os.remove(SL_POLICY_FILE)
+        SL_POLICY_FILE = original_file
+
+
 ATR_TP_RATIO_MULTIPLIERS = (
     Decimal(os.environ.get("ATR_TP_RATIO_1", "2")),
     Decimal(os.environ.get("ATR_TP_RATIO_2", "4")),
@@ -1197,7 +1321,7 @@ def run_once() -> None:
             print(f"  {sym}: opportunity score fails the Kronos+LLM blended gate.")
             continue
 
-        stop_loss_pct = compute_atr_stop_loss_pct(sym, current_price)
+        stop_loss_pct = DEFAULT_STOP_LOSS_PCT if use_fixed_stop_loss() else compute_atr_stop_loss_pct(sym, current_price)
         tp_pcts = compute_atr_take_profit_pcts(stop_loss_pct)
         if not meets_min_reward_risk(tp_pcts[0], stop_loss_pct):
             print(f"  {sym}: R:R {tp_pcts[0] / stop_loss_pct:.2f}:1 (TP1 {tp_pcts[0] * 100:.0f}% / stop "
@@ -1313,6 +1437,7 @@ if __name__ == "__main__":
     _test_golden_trade_marking(os.path.join(tempfile.gettempdir(), "_test_golden.json"))
     _test_compute_opportunity_score()
     _test_compute_atr_stop_loss_pct()
+    _test_use_fixed_stop_loss()
     _test_meets_min_reward_risk()
     _test_check_daily_loss_limit(os.path.join(tempfile.gettempdir(), "_test_daily_loss.json"))
     _test_compute_atr_take_profit_pcts()
