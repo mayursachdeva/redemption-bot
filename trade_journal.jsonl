@@ -45,3 +45,4 @@
 {"symbol": "FLOW", "trade_id": "ec7c3d2499", "leg": 1, "qty": 32650.01, "entry": 0.028043478260869566, "exit_price": 0.03081, "exit_reason": "early_exit_or_manual", "pnl_pct": 9.865116279069765, "closed_at": "2026-07-31T23:28:20.921000+00:00"}
 {"symbol": "TLM", "trade_id": "c8243e00f2", "leg": 0, "qty": 765466.0, "entry": 0.001873408163265306, "exit_price": 0.0016486508140139472, "exit_reason": "stop_loss", "pnl_pct": -11.997244042089163, "closed_at": "2026-08-01T10:31:58.476000+00:00"}
 {"symbol": "TLM", "trade_id": "c8243e00f2", "leg": 1, "qty": 382734.0, "entry": 0.001873408163265306, "exit_price": 0.001648, "exit_reason": "stop_loss", "pnl_pct": -12.031983616022304, "closed_at": "2026-08-01T10:31:58.476000+00:00"}
+{"symbol": "ESP", "trade_id": "17470ce026", "leg": 2, "qty": 9355.0, "entry": 0.07548208440802538, "exit_price": 0.06350149652592196, "exit_reason": "stop_loss", "pnl_pct": -15.872094651415876, "closed_at": "2026-08-03T01:06:30.870000+00:00"}
