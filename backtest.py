@@ -2,6 +2,23 @@
 daily prices. freecryptoapi's historical endpoints are Pro-only (confirmed
 live: getOHLC/getHistory both reject the free-tier key) — using Binance's
 own public klines instead (mainnet, no key, free).
+
+Stop-loss/take-profit sizing mirrors execute.py's live Fib -> ATR -> flat
+fallback chain (compute_fib_stop_loss_pct / compute_atr_stop_loss_pct /
+DEFAULT_STOP_LOSS_PCT) instead of one hardcoded flat percentage for every
+simulated entry — the two used to diverge, so this backtest was testing
+numbers the live bot doesn't actually use. Computed from the pure math
+functions (_compute_atr / _compute_fibonacci_levels) on a HISTORICAL window
+ending at each entry, not the live get_atr()/get_fibonacci_levels() wrappers
+— those only ever fetch "as of right now," which would give every simulated
+day the same today's-ATR/Fib regardless of which historical day is being
+tested. Constants (ATR_MULTIPLIER, the clamp bounds, FIB_STOP_BUFFER_PCT,
+FIB_MAX_SCALE_FACTOR, ATR_TP_RATIO_MULTIPLIERS) are imported from execute.py
+so the numbers stay in sync with live even though the control flow here is
+a small, deliberate duplication of execute.py's formulas — refactoring the
+live functions to accept a pre-fetched window instead of always fetching
+internally was ruled out as unnecessary risk to live-path code for what
+this backtest needs.
 """
 from __future__ import annotations
 
@@ -9,14 +26,24 @@ from decimal import Decimal
 
 import requests
 
-from scanner import MEME_SYMBOLS, equal_profit_fractions
+from execute import (
+    ATR_MAX_STOP_LOSS_PCT,
+    ATR_MIN_STOP_LOSS_PCT,
+    ATR_MULTIPLIER,
+    ATR_TP_RATIO_MULTIPLIERS,
+    DEFAULT_STOP_LOSS_PCT,
+    FIB_MAX_SCALE_FACTOR,
+    FIB_STOP_BUFFER_PCT,
+)
+from scanner import MEME_SYMBOLS, _compute_atr, _compute_fibonacci_levels, equal_profit_fractions
 
-STOP_LOSS_PCT = Decimal("0.15")
-SINGLE_TP_PCT = Decimal("0.30")
-LADDER_TP_PCTS = (Decimal("0.15"), Decimal("0.30"))
-# equal-profit weighted, not equal-quantity — matches execute.py's
-# place_gamble_trade_laddered (a farther target gets a smaller slice)
-LADDER_LEGS = tuple(zip(equal_profit_fractions(LADDER_TP_PCTS), LADDER_TP_PCTS))
+ATR_PERIOD = 14
+FIB_PERIOD = 14
+# Flat fallback tier — same role as DEFAULT_STOP_LOSS_PCT/LADDER_TP_PCTS in
+# execute.py: used only when there's not enough historical window yet for
+# either ATR or Fib (the first ~25 days of any candle series).
+FLAT_STOP_LOSS_PCT = Decimal("0.15")
+FLAT_TP_PCTS = (Decimal("0.15"), Decimal("0.30"))
 
 
 def get_intraday_klines(symbol: str, interval: str, days: float) -> list[dict]:
@@ -57,6 +84,79 @@ def get_daily_klines(symbol: str, days: int = 400) -> list[dict]:
     ]
 
 
+def _window_tuples(candles: list[dict], entry_idx: int, period: int) -> list[tuple[float, float, float]] | None:
+    """candles[entry_idx-period : entry_idx] as (high, low, close) float
+    tuples — the shape _compute_atr/_compute_fibonacci_levels take. None if
+    there's not yet a full period of history before entry_idx."""
+    window = candles[max(0, entry_idx - period) : entry_idx]
+    if len(window) < period:
+        return None
+    return [(float(c["high"]), float(c["low"]), float(c["close"])) for c in window]
+
+
+def atr_stop_pct(candles: list[dict], entry_idx: int) -> Decimal | None:
+    """Mirrors execute.py's compute_atr_stop_loss_pct formula exactly
+    (ATR_MULTIPLIER x ATR / price, clamped to [ATR_MIN_STOP_LOSS_PCT,
+    ATR_MAX_STOP_LOSS_PCT]), computed on the historical window ending at
+    entry_idx. None if there's not enough history yet, or ATR itself can't
+    be computed (degenerate candles) — caller falls back to Fib or flat."""
+    tuples = _window_tuples(candles, entry_idx, ATR_PERIOD)
+    if tuples is None:
+        return None
+    atr = _compute_atr(tuples, ATR_PERIOD)
+    if atr is None:
+        return None
+    price = float(candles[entry_idx]["close"])
+    if price <= 0:
+        return None
+    raw_pct = Decimal(str(atr / price)) * ATR_MULTIPLIER
+    return max(ATR_MIN_STOP_LOSS_PCT, min(ATR_MAX_STOP_LOSS_PCT, raw_pct))
+
+
+def fib_stop_and_tp_pcts(candles: list[dict], entry_idx: int) -> tuple[Decimal, tuple[Decimal, Decimal]] | None:
+    """Mirrors execute.py's compute_fib_stop_loss_pct/compute_fib_take_profit_pcts:
+    stop at the 23.6% retracement (+ FIB_STOP_BUFFER_PCT, clamped to the ATR
+    bounds), take-profit legs at the 161.8%/261.8% extensions scaled by
+    however much the stop's clamp stretched it, capped at FIB_MAX_SCALE_FACTOR.
+    None (no Fib available, or the scale would exceed the cap) — caller
+    falls back to ATR."""
+    tuples = _window_tuples(candles, entry_idx, FIB_PERIOD)
+    if tuples is None:
+        return None
+    levels = _compute_fibonacci_levels(tuples, is_short=False, period=FIB_PERIOD)
+    if levels is None:
+        return None
+    price = Decimal(str(candles[entry_idx]["close"]))
+    if price <= 0:
+        return None
+    level_23_6 = Decimal(str(levels["retracements"][23.6]))
+    raw_pct = abs(price - level_23_6) / price
+    buffered_pct = raw_pct * (1 + FIB_STOP_BUFFER_PCT)
+    clamped_pct = max(ATR_MIN_STOP_LOSS_PCT, min(ATR_MAX_STOP_LOSS_PCT, buffered_pct))
+    scale = clamped_pct / buffered_pct if buffered_pct > 0 else Decimal("1")
+    if scale > FIB_MAX_SCALE_FACTOR:
+        return None
+    tp1 = Decimal(str(levels["extensions"][161.8]))
+    tp2 = Decimal(str(levels["extensions"][261.8]))
+    return (clamped_pct, (abs(tp1 - price) / price * scale, abs(tp2 - price) / price * scale))
+
+
+def sourced_stop_and_tp(candles: list[dict], entry_idx: int) -> tuple[Decimal, tuple[Decimal, Decimal]]:
+    """Fib -> ATR -> flat fallback chain — same precedence execute.py's live
+    call sites use. This is the actual parity fix: every simulated entry now
+    gets stop/TP sized the way the live bot would size it that day, instead
+    of one flat percentage for the whole backtest."""
+    fib = fib_stop_and_tp_pcts(candles, entry_idx)
+    if fib is not None:
+        return fib
+    atr_stop = atr_stop_pct(candles, entry_idx)
+    if atr_stop is not None:
+        tp1 = atr_stop * ATR_TP_RATIO_MULTIPLIERS[0]
+        tp2 = atr_stop * ATR_TP_RATIO_MULTIPLIERS[1]
+        return (atr_stop, (tp1, tp2))
+    return (FLAT_STOP_LOSS_PCT, FLAT_TP_PCTS)
+
+
 def simulate_exit(candles: list[dict], entry_idx: int, tp_pct: Decimal, sl_pct: Decimal) -> Decimal:
     """Walk forward from entry_idx+1 until TP or SL is touched. If both are
     touched on the same day, SL wins — daily bars can't tell intraday order,
@@ -75,13 +175,17 @@ def simulate_exit(candles: list[dict], entry_idx: int, tp_pct: Decimal, sl_pct: 
 
 def backtest_symbol(candles: list[dict], lookahead_buffer: int = 60) -> dict:
     """One simulated entry per day, excluding the last `lookahead_buffer`
-    days (they need room to resolve against future candles)."""
+    days (they need room to resolve against future candles). Stop/TP are
+    sourced per-entry via sourced_stop_and_tp — real historical Fib/ATR
+    sizing, not one flat percentage for the whole run."""
     single_returns, ladder_returns = [], []
     usable = max(len(candles) - lookahead_buffer, 0)
     for i in range(usable):
-        single_returns.append(simulate_exit(candles, i, SINGLE_TP_PCT, STOP_LOSS_PCT))
-        leg_returns = [simulate_exit(candles, i, tp, STOP_LOSS_PCT) for _, tp in LADDER_LEGS]
-        ladder_returns.append(sum(f * r for (f, _), r in zip(LADDER_LEGS, leg_returns)))
+        stop_pct, tp_pcts = sourced_stop_and_tp(candles, i)
+        single_returns.append(simulate_exit(candles, i, tp_pcts[0], stop_pct))
+        legs = tuple(zip(equal_profit_fractions(tp_pcts), tp_pcts))
+        leg_returns = [simulate_exit(candles, i, tp, stop_pct) for _, tp in legs]
+        ladder_returns.append(sum(f * r for (f, _), r in zip(legs, leg_returns)))
     return {"single": single_returns, "ladder": ladder_returns}
 
 
@@ -117,13 +221,30 @@ def _test_simulate_exit() -> None:
     assert simulate_exit(flat, 0, Decimal("0.3"), Decimal("0.15")) == Decimal("0.02")
 
 
-# (fetch_days, lookahead_buffer_candles) per timeframe — buffer is ~24h of
-# room for TP/SL to resolve, converted to candle count for that granularity
-_TIMEFRAME_CONFIG = {
-    "1d": {"days": 400, "buffer": 60},       # 60 days room (matches original backtest)
-    "1m": {"days": 5, "buffer": 1440},       # 5 days of 1m bars, 24h buffer
-    "5m": {"days": 20, "buffer": 288},       # 20 days of 5m bars, 24h buffer
-}
+def _test_sourced_stop_and_tp() -> None:
+    # thin history (< max(ATR_PERIOD, FIB_PERIOD) candles before entry_idx) -> flat fallback
+    thin = [_candle(100, 100, 100) for _ in range(5)]
+    stop_pct, tp_pcts = sourced_stop_and_tp(thin, 3)
+    assert (stop_pct, tp_pcts) == (FLAT_STOP_LOSS_PCT, FLAT_TP_PCTS), (stop_pct, tp_pcts)
+
+    # enough history, flat price action (zero true range) -> ATR is 0, Fib
+    # swing is degenerate (high==low every candle) -> both None -> flat fallback
+    flat_series = [_candle(100, 100, 100) for _ in range(30)]
+    stop_pct, tp_pcts = sourced_stop_and_tp(flat_series, 25)
+    assert (stop_pct, tp_pcts) == (FLAT_STOP_LOSS_PCT, FLAT_TP_PCTS), (stop_pct, tp_pcts)
+
+    # a real swing in the 14-candle window immediately before entry_idx,
+    # with the entry candle itself sitting well clear of the 23.6%
+    # retracement level (so the stop's clamp-to-floor scale factor stays
+    # under FIB_MAX_SCALE_FACTOR instead of triggering the cap) -> Fib
+    # should produce a usable (stop, tp_pcts) pair, preferred over ATR
+    window = [_candle(100, 90, 95) for _ in range(5)] + [_candle(110, 100, 105) for _ in range(9)]
+    swing = window + [_candle(99, 97, 98)]  # entry candle (index 14), not part of the lookback window
+    stop_pct, tp_pcts = sourced_stop_and_tp(swing, 14)
+    assert stop_pct > 0
+    assert tp_pcts[0] > 0 and tp_pcts[1] > tp_pcts[0]
+    direct = fib_stop_and_tp_pcts(swing, 14)
+    assert direct is not None and (stop_pct, tp_pcts) == direct, "Fib should win over ATR when both are available"
 
 
 def run_backtest(timeframe: str) -> None:
@@ -152,10 +273,20 @@ def run_backtest(timeframe: str) -> None:
     print(f"Laddered:   n={l['n']:4d}  win_rate={l['win_rate_pct']:.1f}%  avg_return/trade={l['avg_return_pct']:.2f}%")
 
 
+# (fetch_days, lookahead_buffer_candles) per timeframe — buffer is ~24h of
+# room for TP/SL to resolve, converted to candle count for that granularity
+_TIMEFRAME_CONFIG = {
+    "1d": {"days": 400, "buffer": 60},       # 60 days room (matches original backtest)
+    "1m": {"days": 5, "buffer": 1440},       # 5 days of 1m bars, 24h buffer
+    "5m": {"days": 20, "buffer": 288},       # 20 days of 5m bars, 24h buffer
+}
+
+
 if __name__ == "__main__":
     import sys
 
     _test_simulate_exit()  # fails loudly if the walk-forward logic breaks
+    _test_sourced_stop_and_tp()
     timeframe = sys.argv[1] if len(sys.argv) > 1 else "1d"
     if timeframe not in _TIMEFRAME_CONFIG:
         raise SystemExit(f"Unknown timeframe {timeframe!r} — use one of {list(_TIMEFRAME_CONFIG)}")
