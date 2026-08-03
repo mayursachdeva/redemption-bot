@@ -33,6 +33,7 @@ golden_trade_ids.json
 daily_loss_spot.json
 daily_loss_futures.json
 sl_policy.json
+reversal_exit_markers.json
 KILL_SWITCH
 dashboard.html
 quantstats_report.html

@@ -1204,6 +1204,93 @@ def close_position_early(client: Spot, symbol: str, trade_id: str) -> Decimal:
 
 LAST_SEEN_LEGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_seen_legs.json")
 TRADE_JOURNAL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_journal.jsonl")
+REVERSAL_EXIT_MARKERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reversal_exit_markers.json")
+REVERSAL_EXIT_MARKER_MAX_AGE_SECONDS = 1800  # 30min — outlives every leg of a laddered close in the same reconciliation pass, without growing the file unbounded if a marker is ever never consumed
+
+
+def _load_reversal_exit_markers() -> dict:
+    if os.path.exists(REVERSAL_EXIT_MARKERS_FILE):
+        with open(REVERSAL_EXIT_MARKERS_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_reversal_exit_markers(markers: dict) -> None:
+    with open(REVERSAL_EXIT_MARKERS_FILE, "w") as f:
+        json.dump(markers, f)
+
+
+def mark_reversal_exit(trade_id: str) -> None:
+    """Records that trade_id's close (about to happen via
+    close_position_early/close_short) was triggered by the Kronos-reversal
+    early-exit gate (_should_exit_early/_should_exit_short_early), not a
+    manual or otherwise-unaccounted-for market sell. Journal reconciliation
+    (_classify_and_log_closed_leg/_log_closed_short) checks this marker
+    when classifying a closed leg's exit_reason, so the journal can tell
+    "our own reversal logic decided to bail" apart from anything else that
+    market-sold — 4 of 31 losing trades in the 2026-08-03 loss-pattern
+    analysis carried the old early_exit_or_manual catch-all label with no
+    way to tell which case they actually were."""
+    markers = _load_reversal_exit_markers()
+    markers[trade_id] = datetime.now(timezone.utc).isoformat()
+    _save_reversal_exit_markers(markers)
+
+
+def is_reversal_exit(trade_id: str) -> bool:
+    """Peek, not consume — a trade_id can span multiple legs (laddered spot
+    positions), each classified separately by _classify_and_log_closed_leg
+    in its own reconciliation pass, so the marker must survive until every
+    leg of this trade_id has been reconciled. Stale markers are pruned by
+    prune_stale_reversal_markers instead of being deleted on read here."""
+    return trade_id in _load_reversal_exit_markers()
+
+
+def prune_stale_reversal_markers() -> None:
+    """Call once per reconciliation pass (not per leg). Removes markers
+    older than REVERSAL_EXIT_MARKER_MAX_AGE_SECONDS."""
+    markers = _load_reversal_exit_markers()
+    now = datetime.now(timezone.utc)
+    fresh = {
+        tid: ts for tid, ts in markers.items()
+        if (now - datetime.fromisoformat(ts)).total_seconds() < REVERSAL_EXIT_MARKER_MAX_AGE_SECONDS
+    }
+    if fresh != markers:
+        _save_reversal_exit_markers(fresh)
+
+
+def _test_reversal_exit_markers() -> None:
+    import tempfile
+
+    global REVERSAL_EXIT_MARKERS_FILE
+    original_file = REVERSAL_EXIT_MARKERS_FILE
+    fd, REVERSAL_EXIT_MARKERS_FILE = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    os.remove(REVERSAL_EXIT_MARKERS_FILE)  # missing file -> no markers, not an error
+    try:
+        assert is_reversal_exit("abc123") is False  # no file yet -> not a reversal exit
+
+        mark_reversal_exit("abc123")
+        assert os.path.exists(REVERSAL_EXIT_MARKERS_FILE)
+        assert is_reversal_exit("abc123") is True
+        assert is_reversal_exit("other-trade") is False  # different trade_id, untouched
+
+        # peek, not consume — a laddered close's leg0 and leg1 both classify
+        # separately and both must see the same marker
+        assert is_reversal_exit("abc123") is True
+
+        prune_stale_reversal_markers()
+        assert is_reversal_exit("abc123") is True  # fresh marker survives a prune pass
+
+        # simulate an old marker by writing one with a stale timestamp directly
+        from datetime import datetime, timezone, timedelta
+        stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=REVERSAL_EXIT_MARKER_MAX_AGE_SECONDS + 1)).isoformat()
+        _save_reversal_exit_markers({"abc123": stale_ts})
+        prune_stale_reversal_markers()
+        assert is_reversal_exit("abc123") is False  # pruned
+    finally:
+        if os.path.exists(REVERSAL_EXIT_MARKERS_FILE):
+            os.remove(REVERSAL_EXIT_MARKERS_FILE)
+        REVERSAL_EXIT_MARKERS_FILE = original_file
 
 
 def _leg_key(pos: dict) -> str:
@@ -1249,7 +1336,8 @@ def _classify_and_log_closed_leg(client: Spot, key: str, snapshot: dict) -> None
             latest = max(market_sells, key=lambda o: o["time"])
             if Decimal(latest["executedQty"]) > 0:
                 exit_price = Decimal(latest["cummulativeQuoteQty"]) / Decimal(latest["executedQty"])
-            exit_reason, exit_time = "early_exit_or_manual", latest["time"]
+            exit_reason = "kronos_reversal_exit" if is_reversal_exit(trade_id) else "manual"
+            exit_time = latest["time"]
 
     entry = Decimal(str(snapshot["entry"])) if snapshot["entry"] is not None else None
     pnl_pct = float((exit_price / entry - 1) * 100) if (exit_price is not None and entry) else None
@@ -1279,6 +1367,7 @@ def _reconcile_trade_journal(client: Spot, current_positions: list[dict]) -> Non
     for key, snapshot in last_seen.items():
         if key not in current_keys:
             _classify_and_log_closed_leg(client, key, snapshot)
+    prune_stale_reversal_markers()
 
     new_snapshot = {
         _leg_key(p): {"entry": float(p["entry"]) if p["entry"] is not None else None, "qty": float(p["qty"])}
@@ -1323,6 +1412,7 @@ def manage_open_positions(client: Spot) -> None:
         if _should_exit_early(Decimal(str(pos["pnl_pct"])), forecast_pct):
             print(f"  EARLY EXIT: {pos['symbol']} up {pos['pnl_pct']:+.2f}%, Kronos now predicts "
                   f"{forecast_pct:+.2f}% — locking in profit instead of waiting for the static target.")
+            mark_reversal_exit(pos["trade_id"])
             qty = close_position_early(client, pos["symbol"], pos["trade_id"])
             print(f"  Sold {qty} {pos['symbol']} at market.")
 
@@ -1591,6 +1681,7 @@ def run_once() -> None:
 if __name__ == "__main__":
     _test_round_step()  # fails loudly if the rounding logic breaks
     _test_should_exit_early()
+    _test_reversal_exit_markers()
     _test_update_peak_and_drawdown(os.path.join(tempfile.gettempdir(), "_test_peak.json"))
     _test_confirm_momentum(os.path.join(tempfile.gettempdir(), "_test_confirm.json"))
     _test_golden_trade_marking(os.path.join(tempfile.gettempdir(), "_test_golden.json"))

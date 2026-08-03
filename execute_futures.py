@@ -40,7 +40,10 @@ from execute import (
     fib_entry_signal,
     is_counter_trend,
     is_extended_from_vwap,
+    is_reversal_exit,
     kill_switch_active,
+    mark_reversal_exit,
+    prune_stale_reversal_markers,
     use_fixed_stop_loss,
     make_trade_id,
     meets_min_reward_risk,
@@ -192,6 +195,7 @@ def get_open_short_positions(client: UMFutures) -> list[dict]:
         amt = Decimal(risk[0]["positionAmt"]) if risk else Decimal("0")
         if amt == 0:
             _log_closed_short(client, trade_id, pos)
+            prune_stale_reversal_markers()
             del positions[trade_id]
             changed = True
             continue
@@ -236,7 +240,7 @@ def _log_closed_short(client: UMFutures, trade_id: str, pos: dict) -> None:
         if buys:
             latest = max(buys, key=lambda t: t["time"])
             exit_price = Decimal(latest["price"])
-        exit_reason = "early_exit_or_manual"
+        exit_reason = "kronos_reversal_exit" if is_reversal_exit(trade_id) else "manual"
 
     pnl_pct = float((entry / exit_price - 1) * 100) if exit_price else None
     record = {
@@ -284,6 +288,7 @@ def manage_short_positions(client: UMFutures) -> None:
         if _should_exit_short_early(pos["pnl_pct"], forecast_pct):
             print(f"  SHORT EARLY EXIT: {pos['symbol']} up {pos['pnl_pct']:+.2f}%, Kronos now predicts "
                   f"{forecast_pct:+.2f}% — locking in profit before the bounce.")
+            mark_reversal_exit(pos["trade_id"])
             qty = close_short(client, pos["symbol"], pos["trade_id"])
             print(f"  Bought back {qty} {pos['symbol']} at market.")
 
