@@ -25,12 +25,16 @@ WATCHLIST_COOLDOWN_HOURS = Decimal(os.environ.get("WATCHLIST_COOLDOWN_HOURS", "2
 WATCHLIST_CAPITAL_BONUS = Decimal(os.environ.get("WATCHLIST_CAPITAL_BONUS", "0.05"))  # half a standard nudge — deliberately weaker than the penalty
 WATCHLIST_MIN_BLOCKS = int(os.environ.get("WATCHLIST_MIN_BLOCKS", "2"))  # a single block is coincidence; repetition is signal
 WATCHLIST_MEMORY_HOURS = Decimal(os.environ.get("WATCHLIST_MEMORY_HOURS", "168"))  # 7 days: how long records count and are retained
+WATCHLIST_STOP_OUT_DEDUPE_SECONDS = int(os.environ.get("WATCHLIST_STOP_OUT_DEDUPE_SECONDS", "60"))  # collapses same-instant ladder legs of one stop-out into a single event
+WATCHLIST_CAPITAL_BLOCK_DEDUPE_SECONDS = int(os.environ.get("WATCHLIST_CAPITAL_BLOCK_DEDUPE_SECONDS", "3600"))  # at most one capital-block record per symbol per hour, even though the book is scanned every ~5min
 
 
 def _parse_times(times: list[str]) -> list[datetime]:
     """ISO strings to datetimes, skipping anything unparseable. The watchlist
     is advisory, so a corrupt record must degrade to "no nudge" rather than
     raise into a live trading cycle."""
+    if not isinstance(times, list):
+        return []  # a field value that isn't even a list (int, null, ...) is as unusable as a bad string
     parsed = []
     for t in times:
         try:
@@ -67,7 +71,7 @@ def cooldown_penalty(stop_out_times: list[str], now: datetime) -> Decimal:
     hours_since = Decimal(str((now - max(recent)).total_seconds() / 3600))
     if hours_since >= WATCHLIST_COOLDOWN_HOURS:
         return Decimal("0")
-    decay = 1 - (hours_since / WATCHLIST_COOLDOWN_HOURS)
+    decay = min(1 - (hours_since / WATCHLIST_COOLDOWN_HOURS), Decimal("1"))  # a future-dated timestamp (clock skew) must not exceed full strength
     return -WATCHLIST_COOLDOWN_BASE * len(recent) * decay
 
 
@@ -110,42 +114,88 @@ def _save_watchlist(entries: dict, watchlist_file: str) -> None:
         print(f"  watchlist: couldn't write {watchlist_file}: {e}")
 
 
+_DEDUPE_SECONDS = {"stop_outs": WATCHLIST_STOP_OUT_DEDUPE_SECONDS, "capital_blocks": WATCHLIST_CAPITAL_BLOCK_DEDUPE_SECONDS}
+
+
 def _record(symbol: str, field: str, watchlist_file: str) -> None:
+    """Append one timestamp to `field` for `symbol`, deduped against the most
+    recent existing timestamp in that same field.
+
+    Dedupe window is per-field (see _DEDUPE_SECONDS): laddered spot positions
+    place both legs at the same stop price, so one real stop-out fills both
+    legs and both get classified in the same reconciliation pass — without
+    this, `record_stop_out` fires twice for one trade and doubles the
+    cooldown penalty a first-time offender should get. The capital-block
+    field hits this same mechanism with a wider window because a full book
+    re-blocks the same symbol every ~5min cycle indefinitely.
+
+    A malformed per-symbol entry (not a dict) or field value (not a list) is
+    treated as absent and replaced on write, rather than raising — this is
+    the write side of the "corrupt state must degrade, not kill the trading
+    cycle" contract the rest of this module follows."""
     entries = _load_watchlist(watchlist_file)
-    entry = entries.setdefault(symbol, {"stop_outs": [], "capital_blocks": []})
-    entry.setdefault(field, []).append(datetime.now(timezone.utc).isoformat())
+    entry = entries.get(symbol)
+    if not isinstance(entry, dict):
+        entry = {"stop_outs": [], "capital_blocks": []}
+    times = entry.get(field)
+    if not isinstance(times, list):
+        times = []
+    now = datetime.now(timezone.utc)
+    existing = _parse_times(times)
+    if existing and (now - max(existing)).total_seconds() < _DEDUPE_SECONDS[field]:
+        return  # within the dedupe window of the last event on this field: collapse
+    entry[field] = times + [now.isoformat()]
+    entries[symbol] = entry
     _save_watchlist(entries, watchlist_file)
 
 
-def record_stop_out(symbol: str, watchlist_file: str = WATCHLIST_FILE) -> None:
+def record_stop_out(symbol: str, watchlist_file: str) -> None:
     """Called when a position closes with exit_reason == "stop_loss"."""
     _record(symbol, "stop_outs", watchlist_file)
 
 
-def record_capital_block(symbol: str, watchlist_file: str = WATCHLIST_FILE) -> None:
+def record_capital_block(symbol: str, watchlist_file: str) -> None:
     """Called when a symbol cleared every quality gate and was refused only
     for capital — i.e. any rejection AFTER `chosen` is set."""
     _record(symbol, "capital_blocks", watchlist_file)
 
 
-def watchlist_score_nudge(symbol: str, watchlist_file: str = WATCHLIST_FILE) -> Decimal:
+def watchlist_score_nudge(symbol: str, watchlist_file: str) -> Decimal:
     """Combined advisory nudge for this symbol: cooldown penalty (negative)
-    plus capital-block bonus (positive). Zero when the symbol is unknown."""
+    plus capital-block bonus (positive). Zero when the symbol is unknown.
+
+    While the cooldown is active (penalty != 0) the bonus is withheld, so the
+    composed result can never be positive during a cooldown. This was a
+    spec-level defect, not an implementation bug: the original spec
+    prescribed a plain sum, but a late-decayed penalty (e.g. -0.02, past the
+    cooldown's midpoint) is weaker than the flat +0.05 bonus, so a symbol
+    stopped out ~13h ago with >=2 capital blocks would score net-positive —
+    higher than a symbol never traded — inverting the whole point of the
+    penalty."""
     entry = _load_watchlist(watchlist_file).get(symbol)
-    if not entry:
+    if not isinstance(entry, dict):
         return Decimal("0")
     now = datetime.now(timezone.utc)
-    return (cooldown_penalty(entry.get("stop_outs", []), now)
-            + capital_block_bonus(entry.get("capital_blocks", []), now))
+    penalty = cooldown_penalty(entry.get("stop_outs", []), now)
+    if penalty != 0:
+        return penalty
+    return capital_block_bonus(entry.get("capital_blocks", []), now)
 
 
-def prune_watchlist(watchlist_file: str = WATCHLIST_FILE) -> None:
+def prune_watchlist(watchlist_file: str) -> None:
     """Drop records older than the memory window, then drop symbols left with
-    nothing. Keeps the file bounded without a separate expiry concept."""
+    nothing. Keeps the file bounded without a separate expiry concept.
+
+    A per-symbol entry that isn't a dict (corrupt state) is dropped outright
+    rather than raising — same degrade-not-crash contract as everywhere else
+    in this module, and it doubles as the self-heal that clears a corrupt
+    file off disk instead of it persisting forever."""
     entries = _load_watchlist(watchlist_file)
     now = datetime.now(timezone.utc)
     kept = {}
     for symbol, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
         fresh = {
             field: [t.isoformat() for t in _within_window(entry.get(field, []), now, WATCHLIST_MEMORY_HOURS)]
             for field in ("stop_outs", "capital_blocks")
@@ -156,7 +206,7 @@ def prune_watchlist(watchlist_file: str = WATCHLIST_FILE) -> None:
         _save_watchlist(kept, watchlist_file)
 
 
-def get_watchlist(watchlist_file: str = WATCHLIST_FILE) -> dict:
+def get_watchlist(watchlist_file: str) -> dict:
     return _load_watchlist(watchlist_file)
 
 
@@ -197,6 +247,11 @@ def _test_nudge_math() -> None:
     # blocks outside the memory window don't count toward the threshold
     assert capital_block_bonus([ago(1), ago(float(WATCHLIST_MEMORY_HOURS) + 1)], now) == Decimal("0")
 
+    # a future-dated stop-out (clock skew) must not exceed full-strength
+    # penalty — decay clamped to a max of 1, not left unbounded above
+    future = cooldown_penalty([ago(-5)], now)
+    assert abs(future - -WATCHLIST_COOLDOWN_BASE) < Decimal("0.001"), future
+
     # --- malformed input degrades, never raises ---
     assert cooldown_penalty(["not-a-timestamp"], now) == Decimal("0")
     assert capital_block_bonus(["not-a-timestamp", ago(1)], now) == Decimal("0")
@@ -228,37 +283,74 @@ def _test_watchlist_state() -> None:
 
         # a stop-out produces a negative nudge
         record_stop_out("EPIC", spot_file)
-        assert watchlist_score_nudge("EPIC", spot_file) < 0
+        one = watchlist_score_nudge("EPIC", spot_file)
+        assert one < 0
         assert watchlist_score_nudge("OTHER", spot_file) == Decimal("0")  # symbols independent
 
-        # a second stop-out roughly doubles it
-        one = watchlist_score_nudge("EPIC", spot_file)
+        # REGRESSION (Fix 1 — the ladder double-count bug): laddered spot legs
+        # sit at the same stop price, so one real stop-out fills both legs and
+        # both get classified in the same reconciliation pass, calling
+        # record_stop_out twice within the same instant. That must count as
+        # ONE event, not two — this is the test that would have caught it.
         record_stop_out("EPIC", spot_file)
         two = watchlist_score_nudge("EPIC", spot_file)
-        assert two < one, (one, two)
+        assert abs(two - one) < Decimal("0.001"), (one, two)  # deduped, not doubled
 
-        # one capital block is not enough; two crosses the threshold
+        # REGRESSION (Fix 2 — capital-block dedupe): two immediate calls must
+        # not both persist. WATCHLIST_MIN_BLOCKS=2 requires two DISTINCT
+        # events, so the bonus must not trigger from a back-to-back pair alone.
+        record_capital_block("SAGA", spot_file)
         record_capital_block("SAGA", spot_file)
         assert watchlist_score_nudge("SAGA", spot_file) == Decimal("0")
-        record_capital_block("SAGA", spot_file)
+
+        # two genuinely distinct blocks cross the threshold. Dedupe means this
+        # can't be constructed via two immediate record_capital_block calls
+        # (see above), so write the timestamps directly.
+        state = get_watchlist(spot_file)
+        state["SAGA"] = {"stop_outs": [], "capital_blocks": [
+            (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+            (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+        ]}
+        _save_watchlist(state, spot_file)
         assert watchlist_score_nudge("SAGA", spot_file) == WATCHLIST_CAPITAL_BONUS
 
-        # the two feeds compose on one symbol
-        record_capital_block("EPIC", spot_file)
-        record_capital_block("EPIC", spot_file)
-        # tolerance, not exact equality: the cooldown decays continuously, so
-        # `two` and this call read datetime.now() microseconds apart and the
-        # penalty has ticked fractionally toward zero in between. The point of
-        # the assertion is that the two feeds COMPOSE additively, which a
-        # tolerance verifies just as well.
+        # Fix 3: while a cooldown is active the bonus must not apply, so the
+        # composed nudge can never be net-positive. (This replaces the old
+        # "feeds compose additively" assertion — plain-sum composition is
+        # exactly the spec-level defect Fix 3 corrects; see the docstring on
+        # watchlist_score_nudge.) EPIC's stop-out above is still fresh, so the
+        # cooldown is active and 2 capital blocks must not lift it positive.
+        state = get_watchlist(spot_file)
+        state["EPIC"]["capital_blocks"] = [
+            (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+            (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+        ]
+        _save_watchlist(state, spot_file)
         composed = watchlist_score_nudge("EPIC", spot_file)
-        assert abs(composed - (two + WATCHLIST_CAPITAL_BONUS)) < Decimal("0.001"), composed
+        assert composed <= 0, composed
+        assert abs(composed - two) < Decimal("0.001"), composed  # bonus withheld -> penalty alone
+
+        # REGRESSION (Fix 3, the inversion bug): a stop-out well past the
+        # decay midpoint is weaker than the flat bonus under a plain sum
+        # (-0.10 x 0.458 decay ~= -0.046 vs +0.05), so a symbol 13h into its
+        # cooldown with >=2 capital blocks must still never net positive.
+        state = get_watchlist(spot_file)
+        state["LATE"] = {
+            "stop_outs": [(datetime.now(timezone.utc) - timedelta(hours=13)).isoformat()],
+            "capital_blocks": [
+                (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+                (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat(),
+            ],
+        }
+        _save_watchlist(state, spot_file)
+        late_nudge = watchlist_score_nudge("LATE", spot_file)
+        assert late_nudge <= 0, late_nudge
 
         # books are isolated — a short stop-out means price ROSE, which is
         # bullish for a long, so this must not bleed across
         record_stop_out("EPIC", futures_file)
         assert list(get_watchlist(futures_file)) == ["EPIC"]
-        assert set(get_watchlist(spot_file)) == {"EPIC", "SAGA"}
+        assert set(get_watchlist(spot_file)) == {"EPIC", "SAGA", "LATE"}
 
         # prune drops stale records and then the empty symbol entirely
         stale = (datetime.now(timezone.utc) - timedelta(hours=float(WATCHLIST_MEMORY_HOURS) + 1)).isoformat()
@@ -280,6 +372,27 @@ def _test_watchlist_state() -> None:
             assert watchlist_score_nudge("EPIC", spot_file) == Decimal("0"), bad
             prune_watchlist(spot_file)          # must not raise
             record_stop_out("EPIC", spot_file)  # must not raise
+
+        # REGRESSION (Fix 4): malformed NESTED state — a per-symbol entry that
+        # isn't a dict, or a stop_outs/capital_blocks field that isn't a list —
+        # must degrade the same way a malformed top-level value does, not
+        # raise. Unlike the wrong-top-level-type case above, this is
+        # per-symbol, so a single corrupt entry can't be allowed to kill the
+        # whole cycle (and thus never get pruned off disk).
+        for bad_entry in (
+            "a string",                                          # entry itself not a dict
+            ["a", "list"],                                        # entry itself not a dict
+            {"stop_outs": 5, "capital_blocks": []},                # field not a list
+            {"stop_outs": None, "capital_blocks": []},             # field is null
+        ):
+            _save_watchlist({"BADENTRY": bad_entry}, spot_file)
+            assert watchlist_score_nudge("BADENTRY", spot_file) == Decimal("0"), bad_entry
+
+            _save_watchlist({"BADENTRY": bad_entry}, spot_file)
+            prune_watchlist(spot_file)          # must not raise
+
+            _save_watchlist({"BADENTRY": bad_entry}, spot_file)
+            record_stop_out("BADENTRY", spot_file)  # must not raise
 
         # an unwritable path must degrade, not raise — these run inside a live
         # trading cycle with no surrounding try/except
