@@ -409,6 +409,147 @@ def place_gamble_trade_laddered(
 EARLY_EXIT_MIN_PROFIT_PCT = Decimal("2")  # don't bother early-exiting for noise-level gains
 EARLY_EXIT_FORECAST_THRESHOLD = Decimal("-5")  # Kronos predicted % change below this = "fading"
 
+# Trailing profit-lock. A SECOND, independent profit-protecting exit that does
+# NOT depend on Kronos agreeing — the existing early exit above only fires when
+# the forecast specifically calls a reversal, so BANK rode +67.5% down to
+# +17.5% (2026-08-04) with nothing triggering. Three floors are computed per
+# open trade and the TIGHTEST (highest, in pnl-point terms) wins; falling
+# through it market-closes the position.
+#
+# UNITS: pnl_pct throughout this codebase is PERCENTAGE POINTS (67.5), while
+# stop_loss_pct is a FRACTION (0.08). ratchet_floor_pct converts between them —
+# every other floor here works in points.
+TRAILING_ARM_MIN_PROFIT_PCT = Decimal(os.environ.get("TRAILING_ARM_MIN_PROFIT_PCT", "10"))  # whole system stays dormant below this peak; the static stop-loss governs, as before
+CHANDELIER_ATR_MULTIPLIER = Decimal(os.environ.get("CHANDELIER_ATR_MULTIPLIER", "3"))  # LeBeau's Chandelier Exit, the managed-futures standard: trail ATR x this off the peak
+PEAK_GIVEBACK_PCT = Decimal(os.environ.get("PEAK_GIVEBACK_PCT", "0.35"))  # hard ceiling on retracement: never hand back more than this fraction of peak profit
+RATCHET_STEP_R = Decimal(os.environ.get("RATCHET_STEP_R", "2"))  # R-multiple ratchet: floor sits this many R below the peak, so a +2R winner can never become a loser
+
+
+def chandelier_floor_pct(
+    entry: Decimal, peak_price: Decimal, atr: Decimal | None, is_short: bool = False
+) -> Decimal | None:
+    """Chandelier Exit (Chuck LeBeau) expressed as a pnl-point floor: trail
+    CHANDELIER_ATR_MULTIPLIER x ATR off the best price the trade has seen.
+    Volatility-adaptive — a wild coin gets room to breathe, a calm one is held
+    tight — which is why it's the trend-following standard and why it fits a
+    bot that already sizes stops off ATR everywhere else.
+
+    `peak_price` is the best price for the position's direction: the HIGHEST
+    price seen for a long, the LOWEST for a short. `atr` is in absolute price
+    units (what scanner._compute_atr returns), None when unavailable this
+    cycle — returns None then, and the other floors still apply.
+
+    A long's floor can compute below zero on a huge ATR; that's left alone
+    rather than special-cased, since a nonsense-low floor is simply never the
+    max() winner in effective_trailing_floor and so never binds."""
+    if atr is None or entry <= 0 or peak_price <= 0:
+        return None
+    offset = atr * CHANDELIER_ATR_MULTIPLIER
+    if is_short:
+        floor_price = peak_price + offset  # short profits as price falls, so the floor sits ABOVE the low-water mark
+        return (entry / floor_price - 1) * 100
+    floor_price = peak_price - offset
+    return (floor_price / entry - 1) * 100
+
+
+def ratchet_floor_pct(peak_pnl_pct: Decimal, stop_loss_pct: Decimal) -> Decimal | None:
+    """R-multiple ratchet: floor = peak minus RATCHET_STEP_R units of the
+    trade's own initial risk R (its stop_loss_pct). Encodes the systematic-fund
+    rule "never let a +2R winner turn into a loser" — at exactly 2R the floor
+    lands on breakeven, and it advances from there.
+
+    Continuous rather than stepped (2R -> breakeven, 3R -> 1R, ...): identical
+    at every step point, without the discretization edge cases.
+
+    Returns None below RATCHET_STEP_R of peak profit (not armed yet), which is
+    also what keeps the floor from ever computing negative."""
+    if stop_loss_pct <= 0:
+        return None
+    r_points = stop_loss_pct * 100  # stop_loss_pct is a fraction; peak_pnl_pct is points
+    if peak_pnl_pct < RATCHET_STEP_R * r_points:
+        return None
+    return peak_pnl_pct - RATCHET_STEP_R * r_points
+
+
+def giveback_floor_pct(peak_pnl_pct: Decimal) -> Decimal | None:
+    """Per-trade high-water-mark drawdown limit — the same shape as a fund's
+    own drawdown rule, applied to one position's unrealized profit. Purely
+    proportional, so unlike the Chandelier it doesn't care about volatility;
+    it's the backstop that caps give-back when ATR is wide enough to let the
+    Chandelier trail loosely."""
+    if peak_pnl_pct <= 0:
+        return None
+    return peak_pnl_pct * (1 - PEAK_GIVEBACK_PCT)
+
+
+def effective_trailing_floor(
+    entry: Decimal, peak_price: Decimal, peak_pnl_pct: Decimal,
+    stop_loss_pct: Decimal, atr: Decimal | None, is_short: bool = False,
+) -> Decimal | None:
+    """The tightest of the three floors, or None if the system isn't armed.
+
+    Higher floor = tighter, so max() picks whichever mechanism would bail
+    first; each floor independently returns None when its own precondition
+    isn't met, and those are simply left out of the comparison. None overall
+    means "no floor applies, leave this position to its static bracket"."""
+    if peak_pnl_pct < TRAILING_ARM_MIN_PROFIT_PCT:
+        return None
+    floors = [
+        f for f in (
+            chandelier_floor_pct(entry, peak_price, atr, is_short),
+            ratchet_floor_pct(peak_pnl_pct, stop_loss_pct),
+            giveback_floor_pct(peak_pnl_pct),
+        )
+        if f is not None
+    ]
+    return max(floors) if floors else None
+
+
+def _test_trailing_floors() -> None:
+    # --- chandelier ---
+    # long: entry 100, peak 150, ATR 5 -> floor price 150 - 15 = 135 -> +35%
+    assert chandelier_floor_pct(Decimal("100"), Decimal("150"), Decimal("5")) == Decimal("35")
+    # short: entry 100, peak (low) 50, ATR 5 -> floor price 50 + 15 = 65 -> 100/65-1 = +53.8%
+    short_floor = chandelier_floor_pct(Decimal("100"), Decimal("50"), Decimal("5"), is_short=True)
+    assert abs(short_floor - Decimal("53.846")) < Decimal("0.01"), short_floor
+    # no ATR this cycle -> chandelier abstains, doesn't raise
+    assert chandelier_floor_pct(Decimal("100"), Decimal("150"), None) is None
+    assert chandelier_floor_pct(Decimal("0"), Decimal("150"), Decimal("5")) is None  # guard, no div-by-zero
+
+    # --- ratchet --- (R = 8% -> 8 points)
+    r = Decimal("0.08")
+    assert ratchet_floor_pct(Decimal("10"), r) is None  # 1.25R peak, below the 2R arming bar
+    assert ratchet_floor_pct(Decimal("16"), r) == Decimal("0")  # exactly 2R -> breakeven floor
+    assert ratchet_floor_pct(Decimal("24"), r) == Decimal("8")  # 3R -> floor at 1R
+    assert ratchet_floor_pct(Decimal("67.5"), r) == Decimal("51.5")  # the BANK case
+    assert ratchet_floor_pct(Decimal("50"), Decimal("0")) is None  # no R -> can't ratchet
+
+    # --- giveback ---
+    assert giveback_floor_pct(Decimal("100")) == Decimal("65")  # 35% giveback allowed
+    assert abs(giveback_floor_pct(Decimal("67.5")) - Decimal("43.875")) < Decimal("0.001")
+    assert giveback_floor_pct(Decimal("-5")) is None  # never armed on a losing position
+
+    # --- composition ---
+    # below the arming bar -> no floor at all, static bracket still governs
+    assert effective_trailing_floor(
+        Decimal("100"), Decimal("105"), Decimal("5"), r, Decimal("1")
+    ) is None
+    # BANK: entry 0.06532, peak (low) 0.039, peak pnl +67.5%, R 8%, ATR ~0.002
+    bank = effective_trailing_floor(
+        Decimal("0.06532"), Decimal("0.039"), Decimal("67.5"), r, Decimal("0.002"), is_short=True,
+    )
+    assert bank is not None
+    # tightest of: chandelier ~45.4, ratchet 51.5, giveback 43.9 -> ratchet wins
+    assert abs(bank - Decimal("51.5")) < Decimal("0.01"), bank
+    # ...and it would have fired: the position sank to +17.5%, far under that floor
+    assert Decimal("17.5") < bank
+
+    # armed, but ATR missing -> still floors off ratchet/giveback rather than abstaining
+    no_atr = effective_trailing_floor(
+        Decimal("100"), Decimal("150"), Decimal("50"), r, None,
+    )
+    assert no_atr == Decimal("34"), no_atr  # max(ratchet 50-16=34, giveback 32.5)
+
 PEAK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio_peak.json")
 DRAWDOWN_CIRCUIT_BREAKER_PCT = Decimal(os.environ.get("DRAWDOWN_CIRCUIT_BREAKER_PCT", "0.20"))
 MIN_BET_FRACTION = Decimal(os.environ.get("MIN_BET_FRACTION", "0.5"))  # skip a trade if available room is below this fraction of the normal per-trade size
@@ -1204,8 +1345,125 @@ def close_position_early(client: Spot, symbol: str, trade_id: str) -> Decimal:
 
 LAST_SEEN_LEGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_seen_legs.json")
 TRADE_JOURNAL_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_journal.jsonl")
+TRADE_PEAKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_peaks.json")
+TRADE_PEAKS_FILE_FUTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_peaks_futures.json")
 REVERSAL_EXIT_MARKERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reversal_exit_markers.json")
 REVERSAL_EXIT_MARKER_MAX_AGE_SECONDS = 1800  # 30min — outlives every leg of a laddered close in the same reconciliation pass, without growing the file unbounded if a marker is ever never consumed
+
+
+def _load_trade_peaks(peaks_file: str) -> dict:
+    if os.path.exists(peaks_file):
+        with open(peaks_file) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_trade_peaks(peaks: dict, peaks_file: str) -> None:
+    with open(peaks_file, "w") as f:
+        json.dump(peaks, f)
+
+
+def update_trade_peak(
+    trade_id: str, pnl_pct: Decimal, price: Decimal, is_short: bool = False,
+    peaks_file: str = TRADE_PEAKS_FILE,
+) -> dict:
+    """Ratchet this trade's high-water mark and return it as
+    {"peak_pnl_pct": Decimal, "peak_price": Decimal}. Feeds
+    effective_trailing_floor, which needs both.
+
+    Only ever moves up. pnl_pct is already direction-normalized (positive means
+    profit for a short too), and it's strictly monotonic in price for either
+    direction, so "pnl made a new high" and "price hit a new best" are the same
+    event — recording both together at that moment is what keeps peak_price
+    guaranteed to be the price AT the peak, rather than two values maxed
+    independently that could drift apart.
+
+    `is_short` isn't needed for the comparison for exactly that reason; it's
+    accepted so callers don't have to know that, and so the signature stays
+    honest if the storage ever splits.
+
+    `peaks_file` is per-book (spot vs futures) for the same reason
+    check_daily_loss_limit takes its file: prune_closed_trade_peaks deletes
+    anything outside the open set it's given, so a shared file would have each
+    book wiping the other's peaks every cycle."""
+    peaks = _load_trade_peaks(peaks_file)
+    stored = peaks.get(trade_id)
+    if stored is None or pnl_pct > Decimal(stored["peak_pnl_pct"]):
+        peaks[trade_id] = {"peak_pnl_pct": str(pnl_pct), "peak_price": str(price)}
+        _save_trade_peaks(peaks, peaks_file)
+        return {"peak_pnl_pct": pnl_pct, "peak_price": price}
+    return {"peak_pnl_pct": Decimal(stored["peak_pnl_pct"]), "peak_price": Decimal(stored["peak_price"])}
+
+
+def get_trade_peak(trade_id: str, peaks_file: str = TRADE_PEAKS_FILE) -> dict | None:
+    stored = _load_trade_peaks(peaks_file).get(trade_id)
+    if stored is None:
+        return None
+    return {"peak_pnl_pct": Decimal(stored["peak_pnl_pct"]), "peak_price": Decimal(stored["peak_price"])}
+
+
+def prune_closed_trade_peaks(open_trade_ids: set, peaks_file: str = TRADE_PEAKS_FILE) -> None:
+    """Drop peaks for trades that are no longer open — the delete-on-close
+    pattern short_positions.json uses, NOT the age-based prune the reversal
+    markers use. A peak has to survive as long as its trade, which can be days;
+    any TTL long enough for that wouldn't be bounding anything. Driven off the
+    live open set instead, so it's self-maintaining with no guesswork.
+
+    Deletes everything outside `open_trade_ids`, which is exactly why spot and
+    futures must pass different `peaks_file`s — see update_trade_peak."""
+    peaks = _load_trade_peaks(peaks_file)
+    kept = {tid: v for tid, v in peaks.items() if tid in open_trade_ids}
+    if kept != peaks:
+        _save_trade_peaks(kept, peaks_file)
+
+
+def _test_trade_peaks() -> None:
+    import tempfile
+
+    fd, spot_file = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    os.remove(spot_file)  # missing file -> no peaks, not an error
+    fd, futures_file = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    os.remove(futures_file)
+    try:
+        assert get_trade_peak("t1", spot_file) is None
+
+        # long ratcheting up: pnl and price recorded together
+        p = update_trade_peak("t1", Decimal("5"), Decimal("105"), peaks_file=spot_file)
+        assert p["peak_pnl_pct"] == Decimal("5") and p["peak_price"] == Decimal("105")
+        p = update_trade_peak("t1", Decimal("12"), Decimal("112"), peaks_file=spot_file)
+        assert p["peak_pnl_pct"] == Decimal("12") and p["peak_price"] == Decimal("112")
+
+        # pullback does NOT lower the mark, and reports the retained peak
+        p = update_trade_peak("t1", Decimal("3"), Decimal("103"), peaks_file=spot_file)
+        assert p["peak_pnl_pct"] == Decimal("12"), p
+        assert p["peak_price"] == Decimal("112"), p  # still the price at the peak, not the pullback price
+        assert get_trade_peak("t1", spot_file)["peak_pnl_pct"] == Decimal("12")
+
+        # short: profit rises as price FALLS, so peak_price ratchets DOWN
+        update_trade_peak("t2", Decimal("10"), Decimal("90"), is_short=True, peaks_file=futures_file)
+        p = update_trade_peak("t2", Decimal("30"), Decimal("70"), is_short=True, peaks_file=futures_file)
+        assert p["peak_pnl_pct"] == Decimal("30") and p["peak_price"] == Decimal("70"), p
+        p = update_trade_peak("t2", Decimal("20"), Decimal("80"), is_short=True, peaks_file=futures_file)
+        assert p["peak_price"] == Decimal("70"), p  # bounce doesn't move it
+
+        # the books are isolated: pruning one must not touch the other, which
+        # is the entire reason peaks_file is a parameter
+        prune_closed_trade_peaks(set(), peaks_file=spot_file)  # spot has nothing open
+        assert get_trade_peak("t1", spot_file) is None
+        assert get_trade_peak("t2", futures_file) is not None, "futures peak wiped by a spot prune"
+
+        # prune keeps what's still open
+        update_trade_peak("t3", Decimal("15"), Decimal("115"), peaks_file=spot_file)
+        update_trade_peak("t4", Decimal("15"), Decimal("115"), peaks_file=spot_file)
+        prune_closed_trade_peaks({"t3"}, peaks_file=spot_file)
+        assert get_trade_peak("t3", spot_file) is not None
+        assert get_trade_peak("t4", spot_file) is None
+    finally:
+        for f in (spot_file, futures_file):
+            if os.path.exists(f):
+                os.remove(f)
 
 
 def _load_reversal_exit_markers() -> dict:
@@ -1220,29 +1478,59 @@ def _save_reversal_exit_markers(markers: dict) -> None:
         json.dump(markers, f)
 
 
-def mark_reversal_exit(trade_id: str) -> None:
-    """Records that trade_id's close (about to happen via
-    close_position_early/close_short) was triggered by the Kronos-reversal
-    early-exit gate (_should_exit_early/_should_exit_short_early), not a
-    manual or otherwise-unaccounted-for market sell. Journal reconciliation
-    (_classify_and_log_closed_leg/_log_closed_short) checks this marker
-    when classifying a closed leg's exit_reason, so the journal can tell
-    "our own reversal logic decided to bail" apart from anything else that
-    market-sold — 4 of 31 losing trades in the 2026-08-03 loss-pattern
-    analysis carried the old early_exit_or_manual catch-all label with no
-    way to tell which case they actually were."""
+KRONOS_REVERSAL_EXIT = "kronos_reversal_exit"
+TRAILING_EXIT = "trailing_exit"
+
+
+def _marker_timestamp(entry) -> str:
+    """Markers were originally {trade_id: iso_string} and are now
+    {trade_id: {"reason": ..., "at": iso_string}}. Both shapes are read for as
+    long as any pre-upgrade marker could still be on disk (<=30min), so a
+    restart mid-flight neither crashes the prune nor mislabels a close."""
+    return entry["at"] if isinstance(entry, dict) else entry
+
+
+def mark_early_exit(trade_id: str, reason: str) -> None:
+    """Records WHY trade_id is about to be market-closed (via
+    close_position_early/close_short), so journal reconciliation
+    (_classify_and_log_closed_leg/_log_closed_short) can label the close
+    precisely instead of dropping it in the "manual" catch-all.
+
+    `reason` is one of KRONOS_REVERSAL_EXIT / TRAILING_EXIT. The distinction
+    matters: 4 of 31 losing trades in the 2026-08-03 loss-pattern analysis
+    carried the old early_exit_or_manual catch-all with no way to tell which
+    mechanism actually fired, which is what made the BANK give-back
+    impossible to diagnose after the fact."""
     markers = _load_reversal_exit_markers()
-    markers[trade_id] = datetime.now(timezone.utc).isoformat()
+    markers[trade_id] = {"reason": reason, "at": datetime.now(timezone.utc).isoformat()}
     _save_reversal_exit_markers(markers)
 
 
-def is_reversal_exit(trade_id: str) -> bool:
-    """Peek, not consume — a trade_id can span multiple legs (laddered spot
+def get_early_exit_reason(trade_id: str) -> str | None:
+    """The reason this trade was deliberately closed, or None if nothing
+    marked it (i.e. a genuinely manual/unaccounted close).
+
+    Peek, not consume — a trade_id can span multiple legs (laddered spot
     positions), each classified separately by _classify_and_log_closed_leg
     in its own reconciliation pass, so the marker must survive until every
-    leg of this trade_id has been reconciled. Stale markers are pruned by
-    prune_stale_reversal_markers instead of being deleted on read here."""
-    return trade_id in _load_reversal_exit_markers()
+    leg has been reconciled. Cleanup is prune_stale_reversal_markers'
+    job, not this function's."""
+    entry = _load_reversal_exit_markers().get(trade_id)
+    if entry is None:
+        return None
+    if isinstance(entry, dict):
+        return entry.get("reason", KRONOS_REVERSAL_EXIT)
+    return KRONOS_REVERSAL_EXIT  # pre-upgrade marker: reversal was the only reason that existed
+
+
+def mark_reversal_exit(trade_id: str) -> None:
+    """Back-compat wrapper — see mark_early_exit."""
+    mark_early_exit(trade_id, KRONOS_REVERSAL_EXIT)
+
+
+def is_reversal_exit(trade_id: str) -> bool:
+    """Back-compat wrapper — see get_early_exit_reason."""
+    return get_early_exit_reason(trade_id) == KRONOS_REVERSAL_EXIT
 
 
 def prune_stale_reversal_markers() -> None:
@@ -1251,8 +1539,8 @@ def prune_stale_reversal_markers() -> None:
     markers = _load_reversal_exit_markers()
     now = datetime.now(timezone.utc)
     fresh = {
-        tid: ts for tid, ts in markers.items()
-        if (now - datetime.fromisoformat(ts)).total_seconds() < REVERSAL_EXIT_MARKER_MAX_AGE_SECONDS
+        tid: entry for tid, entry in markers.items()
+        if (now - datetime.fromisoformat(_marker_timestamp(entry))).total_seconds() < REVERSAL_EXIT_MARKER_MAX_AGE_SECONDS
     }
     if fresh != markers:
         _save_reversal_exit_markers(fresh)
@@ -1281,12 +1569,32 @@ def _test_reversal_exit_markers() -> None:
         prune_stale_reversal_markers()
         assert is_reversal_exit("abc123") is True  # fresh marker survives a prune pass
 
-        # simulate an old marker by writing one with a stale timestamp directly
+        # reasons are distinguishable, which is the whole point of the marker
+        mark_early_exit("trail1", TRAILING_EXIT)
+        assert get_early_exit_reason("trail1") == TRAILING_EXIT
+        assert is_reversal_exit("trail1") is False  # a trailing exit is NOT a reversal exit
+        assert get_early_exit_reason("abc123") == KRONOS_REVERSAL_EXIT
+        assert get_early_exit_reason("never-marked") is None
+
         from datetime import datetime, timezone, timedelta
+
+        # pre-upgrade marker shape ({trade_id: iso_string}) still reads as a
+        # reversal exit rather than crashing or silently degrading to "manual"
+        fresh_ts = datetime.now(timezone.utc).isoformat()
+        _save_reversal_exit_markers({"legacy": fresh_ts})
+        assert get_early_exit_reason("legacy") == KRONOS_REVERSAL_EXIT
+        prune_stale_reversal_markers()  # must not choke on the old shape
+        assert get_early_exit_reason("legacy") == KRONOS_REVERSAL_EXIT  # fresh, survives
+
+        # simulate an old marker by writing one with a stale timestamp directly
         stale_ts = (datetime.now(timezone.utc) - timedelta(seconds=REVERSAL_EXIT_MARKER_MAX_AGE_SECONDS + 1)).isoformat()
-        _save_reversal_exit_markers({"abc123": stale_ts})
+        _save_reversal_exit_markers({"abc123": {"reason": KRONOS_REVERSAL_EXIT, "at": stale_ts}})
         prune_stale_reversal_markers()
         assert is_reversal_exit("abc123") is False  # pruned
+        # ...and the same prune works on a stale marker in the legacy shape
+        _save_reversal_exit_markers({"legacy": stale_ts})
+        prune_stale_reversal_markers()
+        assert get_early_exit_reason("legacy") is None
     finally:
         if os.path.exists(REVERSAL_EXIT_MARKERS_FILE):
             os.remove(REVERSAL_EXIT_MARKERS_FILE)
@@ -1336,7 +1644,7 @@ def _classify_and_log_closed_leg(client: Spot, key: str, snapshot: dict) -> None
             latest = max(market_sells, key=lambda o: o["time"])
             if Decimal(latest["executedQty"]) > 0:
                 exit_price = Decimal(latest["cummulativeQuoteQty"]) / Decimal(latest["executedQty"])
-            exit_reason = "kronos_reversal_exit" if is_reversal_exit(trade_id) else "manual"
+            exit_reason = get_early_exit_reason(trade_id) or "manual"
             exit_time = latest["time"]
 
     entry = Decimal(str(snapshot["entry"])) if snapshot["entry"] is not None else None
@@ -1409,12 +1717,46 @@ def manage_open_positions(client: Spot) -> None:
         forecast = checked_symbols[pos["symbol"]]
         forecast_pct = Decimal(str(forecast["predicted_pct_change"])) if forecast else None
 
+        # Logged on every check, firing or not — see execute_futures.py's
+        # mirrored comment for why (found live on BANK, 2026-08-04).
+        forecast_note = f"{forecast_pct:+.2f}%" if forecast_pct is not None else "unavailable"
+        print(f"  {pos['symbol']} pos: pnl {pos['pnl_pct']:+.2f}%, Kronos predicts {forecast_note} "
+              f"(exits if pnl>={EARLY_EXIT_MIN_PROFIT_PCT}% and forecast<={EARLY_EXIT_FORECAST_THRESHOLD}%)")
+
         if _should_exit_early(Decimal(str(pos["pnl_pct"])), forecast_pct):
             print(f"  EARLY EXIT: {pos['symbol']} up {pos['pnl_pct']:+.2f}%, Kronos now predicts "
                   f"{forecast_pct:+.2f}% — locking in profit instead of waiting for the static target.")
-            mark_reversal_exit(pos["trade_id"])
+            mark_early_exit(pos["trade_id"], KRONOS_REVERSAL_EXIT)
             qty = close_position_early(client, pos["symbol"], pos["trade_id"])
             print(f"  Sold {qty} {pos['symbol']} at market.")
+            continue  # closed; don't also run the trailing check on it
+
+        # Trailing profit-lock: independent of Kronos, so it still fires when
+        # the forecast never calls the reversal (the BANK failure mode).
+        # Kronos gets first refusal above because it has richer information;
+        # this is the mechanical backstop under it.
+        if pos["entry"] is not None:
+            peak = update_trade_peak(
+                pos["trade_id"], Decimal(str(pos["pnl_pct"])), pos["current"],
+            )
+            atr = get_atr(pos["symbol"])
+            floor = effective_trailing_floor(
+                entry=pos["entry"],
+                peak_price=peak["peak_price"],
+                peak_pnl_pct=peak["peak_pnl_pct"],
+                stop_loss_pct=_get_trade_stop_pct(pos["trade_id"]),
+                atr=Decimal(str(atr)) if atr is not None else None,
+            )
+            if floor is not None:
+                print(f"    trailing: peak {peak['peak_pnl_pct']:+.2f}%, floor {floor:+.2f}%")
+            if floor is not None and Decimal(str(pos["pnl_pct"])) < floor:
+                print(f"  TRAILING EXIT: {pos['symbol']} peaked at {peak['peak_pnl_pct']:+.2f}%, "
+                      f"now {pos['pnl_pct']:+.2f}% — through the {floor:+.2f}% floor, banking it.")
+                mark_early_exit(pos["trade_id"], TRAILING_EXIT)
+                qty = close_position_early(client, pos["symbol"], pos["trade_id"])
+                print(f"  Sold {qty} {pos['symbol']} at market.")
+
+    prune_closed_trade_peaks({p["trade_id"] for p in positions})
 
 
 def _test_round_step() -> None:
@@ -1682,6 +2024,8 @@ if __name__ == "__main__":
     _test_round_step()  # fails loudly if the rounding logic breaks
     _test_should_exit_early()
     _test_reversal_exit_markers()
+    _test_trailing_floors()
+    _test_trade_peaks()
     _test_update_peak_and_drawdown(os.path.join(tempfile.gettempdir(), "_test_peak.json"))
     _test_confirm_momentum(os.path.join(tempfile.gettempdir(), "_test_confirm.json"))
     _test_golden_trade_marking(os.path.join(tempfile.gettempdir(), "_test_golden.json"))

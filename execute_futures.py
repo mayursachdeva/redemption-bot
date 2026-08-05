@@ -28,7 +28,10 @@ from binance.um_futures import UMFutures
 
 from execute import (
     DAILY_LOSS_LIMIT_PCT,
+    KRONOS_REVERSAL_EXIT,
     MIN_REWARD_RISK_RATIO,
+    TRADE_PEAKS_FILE_FUTURES,
+    TRAILING_EXIT,
     _record_traded_symbol,
     _round_step,
     check_daily_loss_limit,
@@ -37,19 +40,23 @@ from execute import (
     compute_fib_stop_loss_pct,
     compute_fib_take_profit_pcts,
     compute_vwap_deviation_pct,
+    effective_trailing_floor,
     fib_entry_signal,
+    get_early_exit_reason,
     is_counter_trend,
     is_extended_from_vwap,
-    is_reversal_exit,
     kill_switch_active,
-    mark_reversal_exit,
+    mark_early_exit,
+    prune_closed_trade_peaks,
     prune_stale_reversal_markers,
+    update_trade_peak,
     use_fixed_stop_loss,
     make_trade_id,
     meets_min_reward_risk,
     obv_warns_against,
 )
 from scanner import (
+    get_atr,
     get_binance_momentum_short,
     get_binance_universe,
     get_cmc_movers,
@@ -206,6 +213,9 @@ def get_open_short_positions(client: UMFutures) -> list[dict]:
             "trade_id": trade_id, "symbol": pos["symbol"], "qty": Decimal(pos["qty"]),
             "entry": entry, "current": current, "pnl_pct": pnl_pct,
             "leverage": pos["leverage"], "sl_algo_id": pos["sl_algo_id"], "tp_algo_id": pos["tp_algo_id"],
+            # the trailing ratchet needs this trade's own R (its initial risk);
+            # .get() because pre-2026-07 entries predate the field
+            "sl_price": Decimal(pos["sl_price"]) if pos.get("sl_price") else None,
         })
     if changed:
         _save_short_positions(positions)
@@ -240,7 +250,7 @@ def _log_closed_short(client: UMFutures, trade_id: str, pos: dict) -> None:
         if buys:
             latest = max(buys, key=lambda t: t["time"])
             exit_price = Decimal(latest["price"])
-        exit_reason = "kronos_reversal_exit" if is_reversal_exit(trade_id) else "manual"
+        exit_reason = get_early_exit_reason(trade_id) or "manual"
 
     pnl_pct = float((entry / exit_price - 1) * 100) if exit_price else None
     record = {
@@ -285,12 +295,52 @@ def manage_short_positions(client: UMFutures) -> None:
     for pos in positions:
         forecast = get_kronos_forecast(pos["symbol"])
         forecast_pct = Decimal(str(forecast["predicted_pct_change"])) if forecast else None
+        # Logged on every check, firing or not — previously only a firing
+        # exit printed anything, so "was it close?" was unanswerable after
+        # the fact for the checks that didn't trigger (found live on BANK,
+        # 2026-08-04: profit gave back most of a +67% peak with zero trace
+        # of what Kronos was actually predicting along the way).
+        forecast_note = f"{forecast_pct:+.2f}%" if forecast_pct is not None else "unavailable"
+        print(f"  {pos['symbol']} short: pnl {pos['pnl_pct']:+.2f}%, Kronos predicts {forecast_note} "
+              f"(exits if pnl>={EARLY_EXIT_MIN_PROFIT_PCT}% and forecast>={EARLY_EXIT_FORECAST_THRESHOLD}%)")
         if _should_exit_short_early(pos["pnl_pct"], forecast_pct):
             print(f"  SHORT EARLY EXIT: {pos['symbol']} up {pos['pnl_pct']:+.2f}%, Kronos now predicts "
                   f"{forecast_pct:+.2f}% — locking in profit before the bounce.")
-            mark_reversal_exit(pos["trade_id"])
+            mark_early_exit(pos["trade_id"], KRONOS_REVERSAL_EXIT)
             qty = close_short(client, pos["symbol"], pos["trade_id"])
             print(f"  Bought back {qty} {pos['symbol']} at market.")
+            continue  # closed; don't also run the trailing check on it
+
+        # Trailing profit-lock — mirrors execute.py's spot side. This is the
+        # path that would have caught BANK (+67.5% -> +17.5%) when Kronos
+        # never called the reversal.
+        peak = update_trade_peak(
+            pos["trade_id"], pos["pnl_pct"], pos["current"],
+            is_short=True, peaks_file=TRADE_PEAKS_FILE_FUTURES,
+        )
+        atr = get_atr(pos["symbol"])
+        # R for a short is how far the stop sits ABOVE entry
+        stop_loss_pct = (pos["sl_price"] / pos["entry"] - 1) if pos["sl_price"] else Decimal("0")
+        floor = effective_trailing_floor(
+            entry=pos["entry"],
+            peak_price=peak["peak_price"],
+            peak_pnl_pct=peak["peak_pnl_pct"],
+            stop_loss_pct=stop_loss_pct,
+            atr=Decimal(str(atr)) if atr is not None else None,
+            is_short=True,
+        )
+        if floor is not None:
+            print(f"    trailing: peak {peak['peak_pnl_pct']:+.2f}%, floor {floor:+.2f}%")
+        if floor is not None and pos["pnl_pct"] < floor:
+            print(f"  SHORT TRAILING EXIT: {pos['symbol']} peaked at {peak['peak_pnl_pct']:+.2f}%, "
+                  f"now {pos['pnl_pct']:+.2f}% — through the {floor:+.2f}% floor, banking it.")
+            mark_early_exit(pos["trade_id"], TRAILING_EXIT)
+            qty = close_short(client, pos["symbol"], pos["trade_id"])
+            print(f"  Bought back {qty} {pos['symbol']} at market.")
+
+    prune_closed_trade_peaks(
+        {p["trade_id"] for p in positions}, peaks_file=TRADE_PEAKS_FILE_FUTURES,
+    )
 
 
 def _load_worst_confirm_pool() -> list[str]:
