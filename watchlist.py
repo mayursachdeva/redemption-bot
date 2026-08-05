@@ -80,6 +80,77 @@ def capital_block_bonus(block_times: list[str], now: datetime) -> Decimal:
     return WATCHLIST_CAPITAL_BONUS if len(recent) >= WATCHLIST_MIN_BLOCKS else Decimal("0")
 
 
+WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.json")
+WATCHLIST_FILE_FUTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist_futures.json")
+
+_EMPTY_ENTRY = {"stop_outs": [], "capital_blocks": []}
+
+
+def _load_watchlist(watchlist_file: str) -> dict:
+    if not os.path.exists(watchlist_file):
+        return {}
+    try:
+        with open(watchlist_file) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}  # advisory state: a corrupt file must not stop trading
+
+
+def _save_watchlist(entries: dict, watchlist_file: str) -> None:
+    with open(watchlist_file, "w") as f:
+        json.dump(entries, f)
+
+
+def _record(symbol: str, field: str, watchlist_file: str) -> None:
+    entries = _load_watchlist(watchlist_file)
+    entry = entries.setdefault(symbol, {"stop_outs": [], "capital_blocks": []})
+    entry.setdefault(field, []).append(datetime.now(timezone.utc).isoformat())
+    _save_watchlist(entries, watchlist_file)
+
+
+def record_stop_out(symbol: str, watchlist_file: str = WATCHLIST_FILE) -> None:
+    """Called when a position closes with exit_reason == "stop_loss"."""
+    _record(symbol, "stop_outs", watchlist_file)
+
+
+def record_capital_block(symbol: str, watchlist_file: str = WATCHLIST_FILE) -> None:
+    """Called when a symbol cleared every quality gate and was refused only
+    for capital — i.e. any rejection AFTER `chosen` is set."""
+    _record(symbol, "capital_blocks", watchlist_file)
+
+
+def watchlist_score_nudge(symbol: str, watchlist_file: str = WATCHLIST_FILE) -> Decimal:
+    """Combined advisory nudge for this symbol: cooldown penalty (negative)
+    plus capital-block bonus (positive). Zero when the symbol is unknown."""
+    entry = _load_watchlist(watchlist_file).get(symbol)
+    if not entry:
+        return Decimal("0")
+    now = datetime.now(timezone.utc)
+    return (cooldown_penalty(entry.get("stop_outs", []), now)
+            + capital_block_bonus(entry.get("capital_blocks", []), now))
+
+
+def prune_watchlist(watchlist_file: str = WATCHLIST_FILE) -> None:
+    """Drop records older than the memory window, then drop symbols left with
+    nothing. Keeps the file bounded without a separate expiry concept."""
+    entries = _load_watchlist(watchlist_file)
+    now = datetime.now(timezone.utc)
+    kept = {}
+    for symbol, entry in entries.items():
+        fresh = {
+            field: [t.isoformat() for t in _within_window(entry.get(field, []), now, WATCHLIST_MEMORY_HOURS)]
+            for field in ("stop_outs", "capital_blocks")
+        }
+        if any(fresh.values()):
+            kept[symbol] = fresh
+    if kept != entries:
+        _save_watchlist(kept, watchlist_file)
+
+
+def get_watchlist(watchlist_file: str = WATCHLIST_FILE) -> dict:
+    return _load_watchlist(watchlist_file)
+
+
 def _test_nudge_math() -> None:
     now = datetime(2026, 8, 5, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -130,3 +201,88 @@ def _test_nudge_math() -> None:
     # a naive entry alongside valid ones is dropped without disturbing them
     assert cooldown_penalty([naive, ago(1)], now) == cooldown_penalty([ago(1)], now)
     assert capital_block_bonus([naive, ago(1), ago(2)], now) == WATCHLIST_CAPITAL_BONUS
+
+
+def _test_watchlist_state() -> None:
+    import tempfile
+
+    fd, spot_file = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    os.remove(spot_file)  # a missing file is normal, not an error
+    fd, futures_file = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    os.remove(futures_file)
+    try:
+        # nothing recorded -> empty, zero nudge, no raise
+        assert get_watchlist(spot_file) == {}
+        assert watchlist_score_nudge("EPIC", spot_file) == Decimal("0")
+
+        # a stop-out produces a negative nudge
+        record_stop_out("EPIC", spot_file)
+        assert watchlist_score_nudge("EPIC", spot_file) < 0
+        assert watchlist_score_nudge("OTHER", spot_file) == Decimal("0")  # symbols independent
+
+        # a second stop-out roughly doubles it
+        one = watchlist_score_nudge("EPIC", spot_file)
+        record_stop_out("EPIC", spot_file)
+        two = watchlist_score_nudge("EPIC", spot_file)
+        assert two < one, (one, two)
+
+        # one capital block is not enough; two crosses the threshold
+        record_capital_block("SAGA", spot_file)
+        assert watchlist_score_nudge("SAGA", spot_file) == Decimal("0")
+        record_capital_block("SAGA", spot_file)
+        assert watchlist_score_nudge("SAGA", spot_file) == WATCHLIST_CAPITAL_BONUS
+
+        # the two feeds compose on one symbol
+        record_capital_block("EPIC", spot_file)
+        record_capital_block("EPIC", spot_file)
+        # tolerance, not exact equality: the cooldown decays continuously, so
+        # `two` and this call read datetime.now() microseconds apart and the
+        # penalty has ticked fractionally toward zero in between. The point of
+        # the assertion is that the two feeds COMPOSE additively, which a
+        # tolerance verifies just as well.
+        composed = watchlist_score_nudge("EPIC", spot_file)
+        assert abs(composed - (two + WATCHLIST_CAPITAL_BONUS)) < Decimal("0.001"), composed
+
+        # books are isolated — a short stop-out means price ROSE, which is
+        # bullish for a long, so this must not bleed across
+        record_stop_out("EPIC", futures_file)
+        assert list(get_watchlist(futures_file)) == ["EPIC"]
+        assert set(get_watchlist(spot_file)) == {"EPIC", "SAGA"}
+
+        # prune drops stale records and then the empty symbol entirely
+        stale = (datetime.now(timezone.utc) - timedelta(hours=float(WATCHLIST_MEMORY_HOURS) + 1)).isoformat()
+        _save_watchlist({"OLD": {"stop_outs": [stale], "capital_blocks": []}}, spot_file)
+        prune_watchlist(spot_file)
+        assert get_watchlist(spot_file) == {}, get_watchlist(spot_file)
+
+        # pruning one book leaves the other untouched
+        prune_watchlist(spot_file)
+        assert list(get_watchlist(futures_file)) == ["EPIC"]
+    finally:
+        for f in (spot_file, futures_file):
+            if os.path.exists(f):
+                os.remove(f)
+
+
+def _print_watchlist(label: str, watchlist_file: str) -> None:
+    entries = get_watchlist(watchlist_file)
+    print(f"=== {label} ===")
+    if not entries:
+        print("  (empty)")
+        return
+    now = datetime.now(timezone.utc)
+    for symbol in sorted(entries):
+        entry = entries[symbol]
+        stops = len(entry.get("stop_outs", []))
+        blocks = len(entry.get("capital_blocks", []))
+        nudge = watchlist_score_nudge(symbol, watchlist_file)
+        print(f"  {symbol:10} stop-outs={stops}  capital-blocks={blocks}  nudge={nudge:+.3f}")
+
+
+if __name__ == "__main__":
+    _test_nudge_math()
+    _test_watchlist_state()
+    _print_watchlist("SPOT WATCHLIST", WATCHLIST_FILE)
+    _print_watchlist("FUTURES WATCHLIST", WATCHLIST_FILE_FUTURES)

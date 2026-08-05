@@ -34,6 +34,8 @@ daily_loss_spot.json
 daily_loss_futures.json
 sl_policy.json
 reversal_exit_markers.json
+watchlist.json
+watchlist_futures.json
 trade_peaks.json
 trade_peaks_futures.json
 KILL_SWITCH
