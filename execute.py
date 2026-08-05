@@ -980,6 +980,7 @@ FEAR_GREED_NUDGE = Decimal(os.environ.get("FEAR_GREED_NUDGE", "0.1"))
 def compute_opportunity_score(
     llm_confidence: Decimal, kronos_pct: Decimal | None,
     fear_greed: int | None = None, is_short: bool = False, fib_score: Decimal = Decimal("0"),
+    watchlist_nudge: Decimal = Decimal("0"),
 ) -> dict:
     """Two independent confidence scores blended into one buy/no-buy gate,
     instead of the LLM's own confidence being the only thing that decides.
@@ -1012,6 +1013,10 @@ def compute_opportunity_score(
       structural confirmation from Fibonacci retracement levels, on the
       same footing as the Fear & Greed nudge. Defaults to 0 (no effect) so
       every existing caller keeps working unchanged.
+    - watchlist_nudge: advisory memory of this symbol (see watchlist.py) —
+      negative while a stop-out cooldown is decaying, positive when the symbol
+      keeps clearing every gate only to be refused for capital. Defaults to 0
+      so callers that don't consult the watchlist are unaffected.
     """
     if kronos_pct is None:
         kronos_score = Decimal("0")
@@ -1020,7 +1025,7 @@ def compute_opportunity_score(
         kronos_score = max(Decimal("-1"), min(Decimal("1"), signed_pct / KRONOS_NORMALIZE_PCT))
 
     llm_score = llm_confidence
-    opportunity_score = KRONOS_WEIGHT * kronos_score + LLM_WEIGHT * llm_score + fib_score
+    opportunity_score = KRONOS_WEIGHT * kronos_score + LLM_WEIGHT * llm_score + fib_score + watchlist_nudge
 
     fear_greed_note = ""
     if fear_greed is not None:
@@ -1044,12 +1049,13 @@ def compute_opportunity_score(
         "bullish enough to risk a squeeze" if is_short else "bearish enough to fade"
     )
     fib_note = f" Fib structure nudge {fib_score:+.2f}." if fib_score != 0 else ""
+    watchlist_note = f" Watchlist nudge {watchlist_nudge:+.2f}." if watchlist_nudge != 0 else ""
     reasoning = (
         f"Kronos: {kronos_score:+.2f} conviction ({direction}"
         + (f", predicts {kronos_pct:+.2f}%" if kronos_pct is not None else ", no forecast this cycle")
         + f") x weight {KRONOS_WEIGHT} = {KRONOS_WEIGHT * kronos_score:+.2f}. "
         f"LLM: {llm_score:.2f} confidence x weight {LLM_WEIGHT} = {LLM_WEIGHT * llm_score:+.2f}."
-        f"{fear_greed_note}{fib_note} "
+        f"{fear_greed_note}{fib_note}{watchlist_note} "
         f"Opportunity score {opportunity_score:+.2f} vs threshold {OPPORTUNITY_THRESHOLD} -> "
         + ("PASSES." if passes else f"FAILS" + (f" (Kronos veto — {veto_reason} regardless of LLM confidence)." if veto else "."))
     )
@@ -1105,6 +1111,16 @@ def _test_compute_opportunity_score() -> None:
     assert bearish_fib["opportunity_score"] < base_fib, "negative fib_score should lower the opportunity score"
     neutral_fib = compute_opportunity_score(Decimal("0.60"), Decimal("1"), fib_score=Decimal("0"))
     assert neutral_fib["opportunity_score"] == base_fib, "zero fib_score (the default) should be a no-op"
+
+    # watchlist nudge composes additively, same as the fib/fear-greed nudges
+    base_wl = compute_opportunity_score(Decimal("0.60"), Decimal("1"))["opportunity_score"]
+    penalised = compute_opportunity_score(Decimal("0.60"), Decimal("1"), watchlist_nudge=Decimal("-0.1"))
+    assert penalised["opportunity_score"] < base_wl, "a cooldown penalty must lower the score"
+    boosted = compute_opportunity_score(Decimal("0.60"), Decimal("1"), watchlist_nudge=Decimal("0.05"))
+    assert boosted["opportunity_score"] > base_wl, "a capital-block bonus must raise the score"
+    neutral_wl = compute_opportunity_score(Decimal("0.60"), Decimal("1"), watchlist_nudge=Decimal("0"))
+    assert neutral_wl["opportunity_score"] == base_wl, "the default must be an exact no-op"
+    assert "watchlist" in penalised["reasoning"].lower(), penalised["reasoning"]
     print("compute_opportunity_score self-check OK")
 
 
