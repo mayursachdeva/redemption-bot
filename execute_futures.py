@@ -70,6 +70,13 @@ from scanner import (
     get_vwap,
     rank_symbols,
 )
+from watchlist import (
+    WATCHLIST_FILE_FUTURES,
+    prune_watchlist,
+    record_capital_block,
+    record_stop_out,
+    watchlist_score_nudge,
+)
 
 DEX_ENRICH_TOP_N = 15  # how many worst-momentum symbols get the (slower) DEXScreener/Trends/CMC enrichment
 
@@ -282,6 +289,8 @@ def _log_closed_short(client: UMFutures, trade_id: str, pos: dict) -> None:
         if filled_at is not None:
             exit_price = filled_at
             exit_reason = reason
+            if reason == "stop_loss":
+                record_stop_out(pos["symbol"], WATCHLIST_FILE_FUTURES)
         elif algo_needs_cancel(algo):
             try:
                 _cancel_algo_order(client, algo_id)
@@ -386,6 +395,7 @@ def manage_short_positions(client: UMFutures) -> None:
     prune_closed_trade_peaks(
         {p["trade_id"] for p in positions}, peaks_file=TRADE_PEAKS_FILE_FUTURES,
     )
+    prune_watchlist(WATCHLIST_FILE_FUTURES)
 
 
 def _load_worst_confirm_pool() -> list[str]:
@@ -499,6 +509,7 @@ def run_once_short() -> None:
         fib_score = fib_entry_signal(sym, current_price, is_short=True)
         opportunity = compute_opportunity_score(
             Decimal(str(verdict["confidence"])), kronos_pct, fear_greed=fear_greed, is_short=True, fib_score=fib_score,
+            watchlist_nudge=watchlist_score_nudge(sym, WATCHLIST_FILE_FUTURES),
         )
         print(f"  Short opportunity score: {opportunity['reasoning']}")
         if not opportunity["passes"]:
@@ -553,6 +564,7 @@ def run_once_short() -> None:
           f"({FUTURES_MAX_PORTFOLIO_PCT * 100:.0f}% cap)")
     if room <= 0:
         print("Not shorting — already at or over the futures exposure cap.")
+        record_capital_block(worst_symbol, WATCHLIST_FILE_FUTURES)
         return
 
     daily_halted, daily_pnl_pct = check_daily_loss_limit(total_value, DAILY_LOSS_FILE_FUTURES)
@@ -565,6 +577,7 @@ def run_once_short() -> None:
     margin = min(balance, room, per_trade_cap)
     if margin < 5:
         print(f"Not shorting — available margin (${margin:.2f}) too small to be worth a trade.")
+        record_capital_block(worst_symbol, WATCHLIST_FILE_FUTURES)
         return
 
     exchange_info = client.exchange_info()

@@ -34,6 +34,13 @@ from scanner import (
     get_vwap,
     rank_symbols,
 )
+from watchlist import (
+    WATCHLIST_FILE,
+    prune_watchlist,
+    record_capital_block,
+    record_stop_out,
+    watchlist_score_nudge,
+)
 
 DEX_ENRICH_TOP_N = 15  # how many top-momentum symbols get the (slower) DEXScreener lookup
 
@@ -1654,6 +1661,7 @@ def _classify_and_log_closed_leg(client: Spot, key: str, snapshot: dict) -> None
     elif sl_order and Decimal(sl_order["executedQty"]) > 0:
         exit_price = Decimal(sl_order["cummulativeQuoteQty"]) / Decimal(sl_order["executedQty"])
         exit_reason, exit_time = "stop_loss", sl_order["updateTime"]
+        record_stop_out(symbol, WATCHLIST_FILE)
     else:
         market_sells = [o for o in orders if o["side"] == "SELL" and o["type"] == "MARKET" and Decimal(o["executedQty"]) > 0]
         if market_sells:
@@ -1773,6 +1781,7 @@ def manage_open_positions(client: Spot) -> None:
                 print(f"  Sold {qty} {pos['symbol']} at market.")
 
     prune_closed_trade_peaks({p["trade_id"] for p in positions})
+    prune_watchlist(WATCHLIST_FILE)
 
 
 def _test_round_step() -> None:
@@ -1901,6 +1910,7 @@ def run_once() -> None:
         fib_score = fib_entry_signal(sym, current_price)
         opportunity = compute_opportunity_score(
             Decimal(str(verdict["confidence"])), kronos_pct, fear_greed=fear_greed, fib_score=fib_score,
+            watchlist_nudge=watchlist_score_nudge(sym, WATCHLIST_FILE),
         )
         print(f"  Opportunity score: {opportunity['reasoning']}")
         if not opportunity["passes"]:
@@ -1990,6 +2000,7 @@ def run_once() -> None:
 
     if room <= 0:
         print("Not betting — already at or over the portfolio exposure cap.")
+        record_capital_block(top_symbol, WATCHLIST_FILE)
         return
 
     drawdown = _update_peak_and_drawdown(total_value)
@@ -2023,6 +2034,7 @@ def run_once() -> None:
     if bet_size < min_viable_bet:
         print(f"Not betting — remaining room (${bet_size:.2f}) is below {MIN_BET_FRACTION * 100:.0f}% of the "
               f"normal ${per_trade_cap:.2f} bet size (min viable ${min_viable_bet:.2f}). Waiting for room to free up.")
+        record_capital_block(top_symbol, WATCHLIST_FILE)
         return
     print(f"USDT balance: {balance}, betting: {bet_size:.2f} (1/{position_split} of cap, room left after: ${room - bet_size:.2f})")
 
