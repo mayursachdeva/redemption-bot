@@ -83,15 +83,18 @@ def capital_block_bonus(block_times: list[str], now: datetime) -> Decimal:
 WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.json")
 WATCHLIST_FILE_FUTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist_futures.json")
 
-_EMPTY_ENTRY = {"stop_outs": [], "capital_blocks": []}
-
 
 def _load_watchlist(watchlist_file: str) -> dict:
     if not os.path.exists(watchlist_file):
         return {}
     try:
         with open(watchlist_file) as f:
-            return json.load(f)
+            data = json.load(f)
+            # Valid JSON of the wrong type (null, [], string, number) must
+            # degrade to empty, not raise — every caller assumes a dict, and
+            # this state layer runs inside a live trading cycle where an
+            # AttributeError would kill the cycle.
+            return data if isinstance(data, dict) else {}
     except (json.JSONDecodeError, OSError):
         return {}  # advisory state: a corrupt file must not stop trading
 
@@ -260,6 +263,17 @@ def _test_watchlist_state() -> None:
         # pruning one book leaves the other untouched
         prune_watchlist(spot_file)
         assert list(get_watchlist(futures_file)) == ["EPIC"]
+
+        # valid JSON of the wrong type must degrade to empty, not raise —
+        # every caller assumes a dict, and this state layer runs inside a
+        # live trading cycle where an AttributeError would kill the cycle
+        for bad in ("null", "[]", '"a string"', "42"):
+            with open(spot_file, "w") as fh:
+                fh.write(bad)
+            assert get_watchlist(spot_file) == {}, bad
+            assert watchlist_score_nudge("EPIC", spot_file) == Decimal("0"), bad
+            prune_watchlist(spot_file)          # must not raise
+            record_stop_out("EPIC", spot_file)  # must not raise
     finally:
         for f in (spot_file, futures_file):
             if os.path.exists(f):
