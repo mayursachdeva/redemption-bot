@@ -222,6 +222,47 @@ def get_open_short_positions(client: UMFutures) -> list[dict]:
     return rows
 
 
+# Statuses a conditional algo order can no longer act from. The unfilled
+# sibling of a bracket comes back EXPIRED (verified live on EPIC's TP after
+# its SL filled), and a stop the exchange refused comes back REJECTED (COTI,
+# PERCENT_PRICE filter) — cancelling either is a wasted API call whose error
+# then gets swallowed.
+ALGO_TERMINAL_STATUSES = ("FINISHED", "CANCELED", "EXPIRED", "REJECTED")
+
+
+def _algo_decimal(algo: dict, key: str) -> Decimal:
+    """Decimal from an algo-order field that may be absent or null."""
+    raw = algo.get(key)
+    return Decimal(str(raw)) if raw not in (None, "") else Decimal("0")
+
+
+def algo_fill_price(algo: dict) -> Decimal | None:
+    """Fill price if this conditional algo order actually executed, else None.
+
+    Uses actualQty/actualPrice — the fields Binance's algo-order API really
+    returns. The original code checked executedQty and read avgPrice, neither
+    of which exists on the response, so the fill branch was UNREACHABLE:
+    .get("executedQty", "0") always yielded 0, the `> 0` test always failed,
+    and every futures bracket exit fell through to the manual catch-all. 24
+    closed futures trades carried a wrong exit_reason before this was caught
+    (2026-08-05); the spot path was unaffected and correctly logged its own
+    stop_loss/take_profit throughout.
+
+    Verified against the real payload of EPIC's filled stop:
+    algoStatus FINISHED, actualQty "913.5", actualPrice "1.0833000"."""
+    if algo.get("algoStatus") != "FINISHED":
+        return None
+    if _algo_decimal(algo, "actualQty") <= 0:
+        return None
+    price = _algo_decimal(algo, "actualPrice")
+    return price if price > 0 else None
+
+
+def algo_needs_cancel(algo: dict) -> bool:
+    """Whether this algo order is still live and worth cancelling."""
+    return algo.get("algoStatus") not in ALGO_TERMINAL_STATUSES
+
+
 def _log_closed_short(client: UMFutures, trade_id: str, pos: dict) -> None:
     """Figure out how a short closed (SL/TP algo fill, or an explicit market
     close) by checking the two algo orders' status, then append to the short
@@ -232,12 +273,16 @@ def _log_closed_short(client: UMFutures, trade_id: str, pos: dict) -> None:
     for algo_id, reason in ((pos["sl_algo_id"], "stop_loss"), (pos["tp_algo_id"], "take_profit")):
         try:
             algo = client.sign_request("GET", "/fapi/v1/algoOrder", {"algoId": algo_id})
-        except Exception:
+        except Exception as e:
+            # Logged, not swallowed: a silent `continue` here is what let the
+            # unreachable-fill-branch bug above hide for 24 trades.
+            print(f"  journal: couldn't look up {pos['symbol']} {reason} algo {algo_id}: {e}")
             continue
-        if algo.get("algoStatus") == "FINISHED" and Decimal(algo.get("executedQty", "0")) > 0:
-            exit_price = Decimal(algo["avgPrice"])
+        filled_at = algo_fill_price(algo)
+        if filled_at is not None:
+            exit_price = filled_at
             exit_reason = reason
-        elif algo.get("algoStatus") not in ("FINISHED", "CANCELED"):
+        elif algo_needs_cancel(algo):
             try:
                 _cancel_algo_order(client, algo_id)
             except Exception:
@@ -532,6 +577,42 @@ def run_once_short() -> None:
           f"SL={result['stop_price']} TP={result['take_profit']}")
 
 
+def _test_algo_fill_classification() -> None:
+    """Payloads below are the real shapes returned by /fapi/v1/allAlgoOrders,
+    captured 2026-08-05 from EPIC's bracket after its stop filled."""
+    filled_sl = {
+        "clientAlgoId": "fsd4bd3d18fcSL", "orderType": "STOP_MARKET",
+        "algoStatus": "FINISHED", "actualOrderId": "223030785",
+        "actualPrice": "1.0833000", "actualQty": "913.5", "triggerPrice": "1.083200",
+    }
+    expired_sibling = {
+        "clientAlgoId": "fsd4bd3d18fcTP", "orderType": "TAKE_PROFIT_MARKET",
+        "algoStatus": "EXPIRED", "actualOrderId": "", "actualPrice": "0.0000000",
+        "triggerPrice": "0.308200",
+    }
+    live = {"algoStatus": "NEW", "actualOrderId": "", "triggerPrice": "0.0595000"}
+    rejected = {"algoStatus": "REJECTED", "actualOrderId": "", "actualPrice": "0.0000000"}
+
+    # the whole point: a real fill is now detected, at its real price
+    assert algo_fill_price(filled_sl) == Decimal("1.0833000")
+    # ...and nothing else counts as one
+    assert algo_fill_price(expired_sibling) is None
+    assert algo_fill_price(live) is None
+    assert algo_fill_price(rejected) is None
+
+    # only a live order is worth spending a cancel call on
+    assert algo_needs_cancel(live) is True
+    assert algo_needs_cancel(filled_sl) is False
+    assert algo_needs_cancel(expired_sibling) is False  # was firing a pointless cancel before
+    assert algo_needs_cancel(rejected) is False
+
+    # missing/null fields degrade to "didn't fill" instead of raising —
+    # the old code would have KeyError'd on algo["avgPrice"] here
+    assert algo_fill_price({"algoStatus": "FINISHED"}) is None
+    assert algo_fill_price({"algoStatus": "FINISHED", "actualQty": None, "actualPrice": None}) is None
+    assert algo_fill_price({"algoStatus": "FINISHED", "actualQty": "913.5", "actualPrice": "0"}) is None
+
+
 def _test_should_exit_short_early() -> None:
     assert _should_exit_short_early(Decimal("9.8"), Decimal("6")) is True
     assert _should_exit_short_early(Decimal("9.8"), Decimal("2")) is False
@@ -558,5 +639,6 @@ def _test_confirm_worst_candidate(tmp_path: str) -> None:
 if __name__ == "__main__":
     import tempfile
     _test_should_exit_short_early()
+    _test_algo_fill_classification()
     _test_confirm_worst_candidate(os.path.join(tempfile.gettempdir(), "_test_short_confirm.json"))
     run_once_short()
