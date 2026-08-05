@@ -100,8 +100,14 @@ def _load_watchlist(watchlist_file: str) -> dict:
 
 
 def _save_watchlist(entries: dict, watchlist_file: str) -> None:
-    with open(watchlist_file, "w") as f:
-        json.dump(entries, f)
+    try:
+        with open(watchlist_file, "w") as f:
+            json.dump(entries, f)
+    except OSError as e:
+        # Advisory state: losing a record is strictly better than killing a
+        # live trading cycle. Logged rather than swallowed — a silent except
+        # in this codebase once hid a bug across 24 trades.
+        print(f"  watchlist: couldn't write {watchlist_file}: {e}")
 
 
 def _record(symbol: str, field: str, watchlist_file: str) -> None:
@@ -274,6 +280,14 @@ def _test_watchlist_state() -> None:
             assert watchlist_score_nudge("EPIC", spot_file) == Decimal("0"), bad
             prune_watchlist(spot_file)          # must not raise
             record_stop_out("EPIC", spot_file)  # must not raise
+
+        # an unwritable path must degrade, not raise — these run inside a live
+        # trading cycle with no surrounding try/except
+        unwritable = os.path.join(spot_file, "nested", "cannot-exist.json")
+        record_stop_out("EPIC", unwritable)       # must not raise
+        record_capital_block("EPIC", unwritable)  # must not raise
+        prune_watchlist(unwritable)               # must not raise
+        assert get_watchlist(unwritable) == {}    # unreadable path reads as empty
     finally:
         for f in (spot_file, futures_file):
             if os.path.exists(f):
