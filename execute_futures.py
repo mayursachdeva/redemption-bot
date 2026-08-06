@@ -207,7 +207,11 @@ def get_open_short_positions(client: UMFutures) -> list[dict]:
         pair = f"{pos['symbol']}USDT"
         risk = client.get_position_risk(symbol=pair)
         amt = Decimal(risk[0]["positionAmt"]) if risk else Decimal("0")
-        if amt == 0:
+        # >= 0, not == 0: a positive amt means this is no longer the short we
+        # registered (something flipped it long), and treating it as still-open
+        # feeds an inverted pnl_pct straight into the exit checks. Exact-zero
+        # matching is what let the COTI flip re-fire for nine cycles.
+        if amt >= 0:
             _log_closed_short(client, trade_id, pos)
             prune_stale_reversal_markers()
             del positions[trade_id]
@@ -330,7 +334,13 @@ def close_short(client: UMFutures, symbol: str, trade_id: str) -> Decimal:
         except Exception:
             pass
     qty = Decimal(pos["qty"])
-    client.new_order(symbol=pair, side="BUY", type="MARKET", quantity=str(qty))
+    # reduceOnly is load-bearing, not belt-and-braces: without it this BUY can
+    # cross through flat and open a LONG. Live on COTI 2026-08-06 — the exit
+    # fired, the buy overshot, the registry still listed an open short (the
+    # reconciler only prunes at positionAmt==0, which a flipped position never
+    # hits), so it re-fired every cycle and stacked 749,831 COTI of accidental
+    # long before margin ran out and killed the whole short cycle.
+    client.new_order(symbol=pair, side="BUY", type="MARKET", quantity=str(qty), reduceOnly="true")
     return qty
 
 
@@ -347,55 +357,67 @@ def _should_exit_short_early(pnl_pct: Decimal, forecast_pct_change: Decimal | No
 def manage_short_positions(client: UMFutures) -> None:
     positions = get_open_short_positions(client)
     for pos in positions:
-        forecast = get_kronos_forecast(pos["symbol"])
-        forecast_pct = Decimal(str(forecast["predicted_pct_change"])) if forecast else None
-        # Logged on every check, firing or not — previously only a firing
-        # exit printed anything, so "was it close?" was unanswerable after
-        # the fact for the checks that didn't trigger (found live on BANK,
-        # 2026-08-04: profit gave back most of a +67% peak with zero trace
-        # of what Kronos was actually predicting along the way).
-        forecast_note = f"{forecast_pct:+.2f}%" if forecast_pct is not None else "unavailable"
-        print(f"  {pos['symbol']} short: pnl {pos['pnl_pct']:+.2f}%, Kronos predicts {forecast_note} "
-              f"(exits if pnl>={EARLY_EXIT_MIN_PROFIT_PCT}% and forecast>={EARLY_EXIT_FORECAST_THRESHOLD}%)")
-        if _should_exit_short_early(pos["pnl_pct"], forecast_pct):
-            print(f"  SHORT EARLY EXIT: {pos['symbol']} up {pos['pnl_pct']:+.2f}%, Kronos now predicts "
-                  f"{forecast_pct:+.2f}% — locking in profit before the bounce.")
-            mark_early_exit(pos["trade_id"], KRONOS_REVERSAL_EXIT)
-            qty = close_short(client, pos["symbol"], pos["trade_id"])
-            print(f"  Bought back {qty} {pos['symbol']} at market.")
-            continue  # closed; don't also run the trailing check on it
-
-        # Trailing profit-lock — mirrors execute.py's spot side. This is the
-        # path that would have caught BANK (+67.5% -> +17.5%) when Kronos
-        # never called the reversal.
-        peak = update_trade_peak(
-            pos["trade_id"], pos["pnl_pct"], pos["current"],
-            is_short=True, peaks_file=TRADE_PEAKS_FILE_FUTURES,
-        )
-        atr = get_atr(pos["symbol"])
-        # R for a short is how far the stop sits ABOVE entry
-        stop_loss_pct = (pos["sl_price"] / pos["entry"] - 1) if pos["sl_price"] else Decimal("0")
-        floor = effective_trailing_floor(
-            entry=pos["entry"],
-            peak_price=peak["peak_price"],
-            peak_pnl_pct=peak["peak_pnl_pct"],
-            stop_loss_pct=stop_loss_pct,
-            atr=Decimal(str(atr)) if atr is not None else None,
-            is_short=True,
-        )
-        if floor is not None:
-            print(f"    trailing: peak {peak['peak_pnl_pct']:+.2f}%, floor {floor:+.2f}%")
-        if floor is not None and pos["pnl_pct"] < floor:
-            print(f"  SHORT TRAILING EXIT: {pos['symbol']} peaked at {peak['peak_pnl_pct']:+.2f}%, "
-                  f"now {pos['pnl_pct']:+.2f}% — through the {floor:+.2f}% floor, banking it.")
-            mark_early_exit(pos["trade_id"], TRAILING_EXIT)
-            qty = close_short(client, pos["symbol"], pos["trade_id"])
-            print(f"  Bought back {qty} {pos['symbol']} at market.")
+        # Per-position isolation: an exchange error on one symbol used to
+        # propagate out and abort the whole cycle, so every position after it
+        # in iteration order went unchecked. COTI's "Margin is insufficient"
+        # did exactly that, silently leaving BANK's armed +35% trailing floor
+        # unenforced for as long as COTI kept failing.
+        try:
+            _manage_one_short(client, pos)
+        except Exception as e:
+            print(f"  {pos['symbol']} check failed, skipping to next position: {e}")
 
     prune_closed_trade_peaks(
         {p["trade_id"] for p in positions}, peaks_file=TRADE_PEAKS_FILE_FUTURES,
     )
     prune_watchlist(WATCHLIST_FILE_FUTURES)
+
+
+def _manage_one_short(client: UMFutures, pos: dict) -> None:
+    forecast = get_kronos_forecast(pos["symbol"])
+    forecast_pct = Decimal(str(forecast["predicted_pct_change"])) if forecast else None
+    # Logged on every check, firing or not — previously only a firing
+    # exit printed anything, so "was it close?" was unanswerable after
+    # the fact for the checks that didn't trigger (found live on BANK,
+    # 2026-08-04: profit gave back most of a +67% peak with zero trace
+    # of what Kronos was actually predicting along the way).
+    forecast_note = f"{forecast_pct:+.2f}%" if forecast_pct is not None else "unavailable"
+    print(f"  {pos['symbol']} short: pnl {pos['pnl_pct']:+.2f}%, Kronos predicts {forecast_note} "
+          f"(exits if pnl>={EARLY_EXIT_MIN_PROFIT_PCT}% and forecast>={EARLY_EXIT_FORECAST_THRESHOLD}%)")
+    if _should_exit_short_early(pos["pnl_pct"], forecast_pct):
+        print(f"  SHORT EARLY EXIT: {pos['symbol']} up {pos['pnl_pct']:+.2f}%, Kronos now predicts "
+              f"{forecast_pct:+.2f}% — locking in profit before the bounce.")
+        mark_early_exit(pos["trade_id"], KRONOS_REVERSAL_EXIT)
+        qty = close_short(client, pos["symbol"], pos["trade_id"])
+        print(f"  Bought back {qty} {pos['symbol']} at market.")
+        return  # closed; don't also run the trailing check on it
+
+    # Trailing profit-lock — mirrors execute.py's spot side. This is the
+    # path that would have caught BANK (+67.5% -> +17.5%) when Kronos
+    # never called the reversal.
+    peak = update_trade_peak(
+        pos["trade_id"], pos["pnl_pct"], pos["current"],
+        is_short=True, peaks_file=TRADE_PEAKS_FILE_FUTURES,
+    )
+    atr = get_atr(pos["symbol"])
+    # R for a short is how far the stop sits ABOVE entry
+    stop_loss_pct = (pos["sl_price"] / pos["entry"] - 1) if pos["sl_price"] else Decimal("0")
+    floor = effective_trailing_floor(
+        entry=pos["entry"],
+        peak_price=peak["peak_price"],
+        peak_pnl_pct=peak["peak_pnl_pct"],
+        stop_loss_pct=stop_loss_pct,
+        atr=Decimal(str(atr)) if atr is not None else None,
+        is_short=True,
+    )
+    if floor is not None:
+        print(f"    trailing: peak {peak['peak_pnl_pct']:+.2f}%, floor {floor:+.2f}%")
+    if floor is not None and pos["pnl_pct"] < floor:
+        print(f"  SHORT TRAILING EXIT: {pos['symbol']} peaked at {peak['peak_pnl_pct']:+.2f}%, "
+              f"now {pos['pnl_pct']:+.2f}% — through the {floor:+.2f}% floor, banking it.")
+        mark_early_exit(pos["trade_id"], TRAILING_EXIT)
+        qty = close_short(client, pos["symbol"], pos["trade_id"])
+        print(f"  Bought back {qty} {pos['symbol']} at market.")
 
 
 def _load_worst_confirm_pool() -> list[str]:
@@ -649,9 +671,49 @@ def _test_confirm_worst_candidate(tmp_path: str) -> None:
             os.remove(tmp_path)
 
 
+def _test_flipped_position_is_not_an_open_short(tmp_path: str) -> None:
+    """The COTI 2026-08-06 regression: a short bought back without reduceOnly
+    crossed flat into a long, and the ==0 prune never matched, so the registry
+    kept serving it as an open short with an inverted pnl."""
+    global SHORT_POSITIONS_FILE, _log_closed_short
+    original_file, original_log = SHORT_POSITIONS_FILE, _log_closed_short
+    SHORT_POSITIONS_FILE = tmp_path
+    closed = []
+    _log_closed_short = lambda client, trade_id, pos: closed.append(pos["symbol"])
+
+    class FakeClient:
+        def __init__(self, amt):
+            self.amt = amt
+
+        def get_position_risk(self, symbol):
+            return [{"positionAmt": self.amt, "markPrice": "0.0150"}]
+
+    entry = {"symbol": "COTI", "qty": "63277", "entry_price": "0.0142920", "leverage": 3,
+             "sl_algo_id": 1, "tp_algo_id": 2, "sl_price": "0.0162330"}
+    try:
+        for amt, label in (("749831", "flipped long"), ("0", "flat")):
+            closed.clear()
+            _save_short_positions({"t1": dict(entry)})
+            rows = get_open_short_positions(FakeClient(amt))
+            assert rows == [], f"{label} still reported as an open short: {rows}"
+            assert closed == ["COTI"], f"{label} was not journaled as closed"
+            assert _load_short_positions() == {}, f"{label} was not pruned from the registry"
+
+        # a genuinely open short must survive the same path
+        _save_short_positions({"t1": dict(entry)})
+        rows = get_open_short_positions(FakeClient("-63277"))
+        assert [r["symbol"] for r in rows] == ["COTI"], "live short was pruned by mistake"
+    finally:
+        SHORT_POSITIONS_FILE, _log_closed_short = original_file, original_log
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 if __name__ == "__main__":
     import tempfile
     _test_should_exit_short_early()
     _test_algo_fill_classification()
     _test_confirm_worst_candidate(os.path.join(tempfile.gettempdir(), "_test_short_confirm.json"))
+    _test_flipped_position_is_not_an_open_short(
+        os.path.join(tempfile.gettempdir(), "_test_short_positions.json"))
     run_once_short()
