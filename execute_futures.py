@@ -219,7 +219,12 @@ def get_open_short_positions(client: UMFutures) -> list[dict]:
             continue
         current = Decimal(risk[0]["markPrice"])
         entry = Decimal(pos["entry_price"])
-        pnl_pct = (entry / current - 1) * 100  # short: profit when price falls
+        # Return on the capital committed at entry, so the denominator is entry
+        # — not current. (entry/current - 1) divides by the *exit* price, which
+        # overstates winners and understates losers; it read BANK as +57.14%
+        # where the exchange showed +36.49% on a $138.09 entry notional.
+        # Mirror of execute.py's long formula, sign-flipped.
+        pnl_pct = (entry - current) / entry * 100  # short: profit when price falls
         rows.append({
             "trade_id": trade_id, "symbol": pos["symbol"], "qty": Decimal(pos["qty"]),
             "entry": entry, "current": current, "pnl_pct": pnl_pct,
@@ -310,7 +315,8 @@ def _log_closed_short(client: UMFutures, trade_id: str, pos: dict) -> None:
             exit_price = Decimal(latest["price"])
         exit_reason = get_early_exit_reason(trade_id) or "manual"
 
-    pnl_pct = float((entry / exit_price - 1) * 100) if exit_price else None
+    # entry denominator, matching get_open_short_positions — see the note there
+    pnl_pct = float((entry - exit_price) / entry * 100) if exit_price else None
     record = {
         "symbol": pos["symbol"], "trade_id": trade_id, "qty": pos["qty"], "entry": pos["entry_price"],
         "exit_price": float(exit_price) if exit_price else None, "exit_reason": exit_reason,
@@ -709,8 +715,46 @@ def _test_flipped_position_is_not_an_open_short(tmp_path: str) -> None:
             os.remove(tmp_path)
 
 
+def _test_short_pnl_uses_entry_denominator(tmp_path: str) -> None:
+    """BANK 2026-08-07: (entry/current - 1) divides by the exit price, so it
+    read a +36.49% winner as +57.14% and an -8.00% loser as -7.41%. pnl_pct
+    must be return on entry notional, matching what the exchange reports."""
+    global SHORT_POSITIONS_FILE
+    original_file = SHORT_POSITIONS_FILE
+    SHORT_POSITIONS_FILE = tmp_path
+
+    class FakeClient:
+        def __init__(self, mark):
+            self.mark = mark
+
+        def get_position_risk(self, symbol):
+            return [{"positionAmt": "-2114", "markPrice": self.mark}]
+
+    # BANK: sold 2114 @ 0.06532 ($138.09 notional), mark 0.04148.
+    # Exchange uPNL was +$50.39 -> +36.49% on entry notional.
+    entry = {"symbol": "BANK", "qty": "2114", "entry_price": "0.06532", "leverage": 3,
+             "sl_algo_id": 1, "tp_algo_id": 2, "sl_price": "0.07185"}
+    try:
+        _save_short_positions({"t1": dict(entry)})
+        pnl = get_open_short_positions(FakeClient("0.04148"))[0]["pnl_pct"]
+        expected = Decimal("50.39") / (Decimal("2114") * Decimal("0.06532")) * 100
+        assert abs(pnl - expected) < Decimal("0.01"), f"winner: got {pnl}, exchange says {expected}"
+        assert pnl < Decimal("57"), f"still using the exit-price denominator: {pnl}"
+
+        # XPL: entry 0.0725, stopped out at 0.0783 -> -8.00%, not -7.41%
+        _save_short_positions({"t1": dict(entry, symbol="XPL", entry_price="0.0725")})
+        pnl = get_open_short_positions(FakeClient("0.0783"))[0]["pnl_pct"]
+        assert abs(pnl - Decimal("-8.0")) < Decimal("0.01"), f"loser: got {pnl}, want -8.00"
+    finally:
+        SHORT_POSITIONS_FILE = original_file
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 if __name__ == "__main__":
     import tempfile
+    _test_short_pnl_uses_entry_denominator(
+        os.path.join(tempfile.gettempdir(), "_test_short_pnl.json"))
     _test_should_exit_short_early()
     _test_algo_fill_classification()
     _test_confirm_worst_candidate(os.path.join(tempfile.gettempdir(), "_test_short_confirm.json"))

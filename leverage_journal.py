@@ -143,11 +143,16 @@ def build_shorts_dataframe(rows: list[dict]) -> pd.DataFrame:
     records = []
     for i, r in enumerate(rows, 1):
         capital = r["qty"] * r["buy_price"]
-        short_pnl_pct = (r["buy_price"] / r["sell_price"] - 1) * 100
+        # entry denominator, same as simulate_leverage_short's -(sell/buy - 1).
+        # (buy/sell - 1) divided by the cover price instead, so this column
+        # disagreed with the {lev}x columns beside it by more than the leverage.
+        short_pnl_pct = (r["buy_price"] - r["sell_price"]) / r["buy_price"] * 100
         short_pnl_dollars = capital * short_pnl_pct / 100
         record = {
             "#": i, "Symbol": r["symbol"], "Status": "OPEN" if r["open"] else "CLOSED",
-            "Qty": float(r["qty"]), "Short Entry": float(r["sell_price"]), "Cover Price": float(r["buy_price"]),
+            # docstring + simulate_leverage_short both treat buy_price as the
+            # short's entry; these two labels were the wrong way round
+            "Qty": float(r["qty"]), "Short Entry": float(r["buy_price"]), "Cover Price": float(r["sell_price"]),
             "Opened (UTC)": fmt_time(r["buy_time"]),
             "Closed (UTC)": fmt_time(r["sell_time"]) if r["sell_time"] else "",
             "Capital Allocated ($)": round(float(capital), 2),

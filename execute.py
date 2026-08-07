@@ -454,7 +454,12 @@ def chandelier_floor_pct(
     offset = atr * CHANDELIER_ATR_MULTIPLIER
     if is_short:
         floor_price = peak_price + offset  # short profits as price falls, so the floor sits ABOVE the low-water mark
-        return (entry / floor_price - 1) * 100
+        # entry denominator, matching the long branch below and the short
+        # pnl_pct in execute_futures. (entry/floor_price - 1) divided by the
+        # floor price instead, so it returned a floor in a different unit than
+        # the pnl it gets compared against — it read BANK's floor as +49.47%
+        # against a +36.77% peak, a floor above its own peak.
+        return (entry - floor_price) / entry * 100
     floor_price = peak_price - offset
     return (floor_price / entry - 1) * 100
 
@@ -516,9 +521,13 @@ def _test_trailing_floors() -> None:
     # --- chandelier ---
     # long: entry 100, peak 150, ATR 5 -> floor price 150 - 15 = 135 -> +35%
     assert chandelier_floor_pct(Decimal("100"), Decimal("150"), Decimal("5")) == Decimal("35")
-    # short: entry 100, peak (low) 50, ATR 5 -> floor price 50 + 15 = 65 -> 100/65-1 = +53.8%
+    # short: entry 100, peak (low) 50, ATR 5 -> floor price 50 + 15 = 65 -> (100-65)/100 = +35%
     short_floor = chandelier_floor_pct(Decimal("100"), Decimal("50"), Decimal("5"), is_short=True)
-    assert abs(short_floor - Decimal("53.846")) < Decimal("0.01"), short_floor
+    assert abs(short_floor - Decimal("35")) < Decimal("0.01"), short_floor
+    # a floor can never exceed the peak pnl it is measured against: same entry
+    # and peak, the peak itself is (100-50)/100 = +50%, so the floor sits below
+    short_peak_pnl = (Decimal("100") - Decimal("50")) / Decimal("100") * 100
+    assert short_floor < short_peak_pnl, f"floor {short_floor} above peak {short_peak_pnl}"
     # no ATR this cycle -> chandelier abstains, doesn't raise
     assert chandelier_floor_pct(Decimal("100"), Decimal("150"), None) is None
     assert chandelier_floor_pct(Decimal("0"), Decimal("150"), Decimal("5")) is None  # guard, no div-by-zero
